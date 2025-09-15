@@ -1,17 +1,19 @@
-[tool.poetry]
-name = "orca-retargeter"
+[project]
+name = "orca_teleop"
 version = "0.1.0"
-description = "A retargeting system for the Orca hand"
-authors = ["Clemens Christoph <cchristoph@ethz.ch>"]
+description = "A teleoperation system for the Orca hand"
+authors = [
+    {name = "Maximilian Eberlein", email = "meberlein@ethz.ch"}
+]
 readme = "README.md"
-
-[tool.poetry.dependencies]
-python = "^3.10"
-pyyaml = ">=6.0.2,<7.0.0"
-numpy = "<2"
-torch = "2.2.0"
-pytorch-kinematics = ">=0.7.5,<0.8.0"
-avp-stream = ">=1.0,<2.0"
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml>=6.0.2,<7.0.0",
+    "numpy>=2.0.0,<3.0.0",
+    "torch>=2.8.0",
+    "avp-stream>=1.0,<2.0",
+    "mediapipe-numpy2",
+]
 
 [build-system]
 requires = ["poetry-core"]
