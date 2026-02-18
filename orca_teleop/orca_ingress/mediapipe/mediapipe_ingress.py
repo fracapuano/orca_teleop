@@ -7,6 +7,16 @@ import os
 from typing import Optional, Callable
 from orca_core import OrcaHand
 from mediapipe.framework.formats import landmark_pb2
+from mediapipe.python.solutions import drawing_utils, drawing_styles, hands
+
+# mediapipe-numpy2 doesn't re-export solutions at the top level
+if not hasattr(mp, 'solutions'):
+    import types
+    mp.solutions = types.SimpleNamespace(
+        drawing_utils=drawing_utils,
+        drawing_styles=drawing_styles,
+        hands=hands,
+    )
 
 class MediaPipeIngress:
     """MediaPipe hand tracking that processes hand landmarks."""

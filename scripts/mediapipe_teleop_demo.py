@@ -5,11 +5,11 @@ import numpy as np
 import cv2
 import argparse
 from orca_teleop import MediaPipeIngress, Retargeter
-from orca_core import OrcaHand
 
 
 def robot_control_process_worker(q, stop, ready, model_path):
     try:
+        from orca_core import OrcaHand
         hand = OrcaHand(model_path)
         success, message = hand.connect()
         if not success:
@@ -39,36 +39,54 @@ def process_landmarks(landmarks):
     angles = retargeter.retarget({"hand_landmarks": landmarks})
     if angles_queue:
         angles_queue.put_nowait(angles)
-    
+    if viewer:
+        viewer.update(angles)
+
 
 def main():
-    global retargeter, angles_queue
+    global retargeter, angles_queue, viewer
     parser = argparse.ArgumentParser(description='MediaPipe to Orca Hand teleop demo')
     parser.add_argument('model_path')
     parser.add_argument('urdf_path')
     parser.add_argument('--no-display', action='store_true')
+    parser.add_argument('--no-viewer', action='store_true', help='Disable 3D URDF viewer')
+    parser.add_argument('--no-robot', action='store_true', help='Run without robot hardware')
     args = parser.parse_args()
-    
+
+    viewer = None
+    if not args.no_viewer:
+        try:
+            from orca_teleop.viewer import URDFViewer
+            viewer = URDFViewer(args.urdf_path)
+        except ImportError:
+            print("viser not installed — skipping 3D viewer (pip install -e '.[viewer]')")
+        except Exception as e:
+            print(f"Failed to start viewer: {e}")
+
     retargeter = Retargeter(args.model_path, args.urdf_path, source="mediapipe")
     ingress = MediaPipeIngress(args.model_path, callback=process_landmarks)
-    
+
     robot_control_process = None
     stop_robot_control = None
-    
-    angles_queue = multiprocessing.Queue()
-    stop_robot_control = multiprocessing.Event()
-    robot_ready_event = multiprocessing.Event()
-    robot_control_process = multiprocessing.Process(
-        target=robot_control_process_worker,
-        args=(angles_queue, stop_robot_control, robot_ready_event, args.model_path), daemon=True)
-    
-    robot_control_process.start()
-    if not robot_ready_event.wait(timeout=5.0):
-        print("Robot initialization timeout. Exiting.")
-        robot_control_process.terminate()
-        return 1
+    angles_queue = None
+
+    if not args.no_robot:
+        from orca_core import OrcaHand
+        angles_queue = multiprocessing.Queue()
+        stop_robot_control = multiprocessing.Event()
+        robot_ready_event = multiprocessing.Event()
+        robot_control_process = multiprocessing.Process(
+            target=robot_control_process_worker,
+            args=(angles_queue, stop_robot_control, robot_ready_event, args.model_path), daemon=True)
+
+        robot_control_process.start()
+        if not robot_ready_event.wait(timeout=5.0):
+            print("Robot initialization timeout. Exiting.")
+            robot_control_process.terminate()
+            return 1
+
     ingress.start()
-    
+
     try:
         if args.no_display:
             print("Headless mode. Ctrl+C to quit")
@@ -85,6 +103,8 @@ def main():
     finally:
         print("Stopping demo...")
         ingress.cleanup()
+        if viewer:
+            viewer.close()
         if robot_control_process and robot_control_process.is_alive():
             stop_robot_control.set()
             robot_control_process.join(timeout=3.0)
