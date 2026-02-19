@@ -41,17 +41,21 @@ def process_landmarks(landmarks):
         angles_queue.put_nowait(angles)
     if viewer:
         viewer.update(angles)
+        if show_mano and retargeter.mano_points is not None:
+            viewer.update_mano_points(retargeter.mano_points)
 
 
 def main():
-    global retargeter, angles_queue, viewer
+    global retargeter, angles_queue, viewer, show_mano
     parser = argparse.ArgumentParser(description='MediaPipe to Orca Hand teleop demo')
     parser.add_argument('model_path')
     parser.add_argument('urdf_path')
     parser.add_argument('--no-display', action='store_true')
     parser.add_argument('--no-viewer', action='store_true', help='Disable 3D URDF viewer')
     parser.add_argument('--no-robot', action='store_true', help='Run without robot hardware')
+    parser.add_argument('--show-mano', action='store_true', help='Show MANO landmarks in 3D viewer')
     args = parser.parse_args()
+    show_mano = args.show_mano
 
     viewer = None
     if not args.no_viewer:
@@ -90,12 +94,15 @@ def main():
     try:
         if args.no_display:
             print("Headless mode. Ctrl+C to quit")
-            while True:
-                time.sleep(1)
+            while not (viewer and viewer.stopped):
+                time.sleep(0.1)
         else:
-            print("Demo running. Press 'q' to quit")
+            print("Demo running. Press 'q' or ESC to quit")
             while True:
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                if viewer and viewer.stopped:
+                    break
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord('q'), 27):
                     break
                 ingress.display_frame()
     except KeyboardInterrupt:

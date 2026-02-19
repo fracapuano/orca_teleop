@@ -60,7 +60,19 @@ class Retargeter:
         self.urdfhand_center, self.urdfhand_rot_matrix, self.optimization_frames = retargeter_utils.get_urdf_model_params(
             self.chain, self.hand_type, self.fingers, self.root)
 
-    
+        # Compute URDF key vector magnitudes at zero config (for auto-scaling)
+        zero_angles = torch.zeros(self.chain.n_joints, device=self.device)
+        urdf_fingertips, urdf_palm = retargeter_utils.extract_orca_fingertips_and_palm(
+            self.chain, zero_angles, self.optimization_frames, self.hand_type, self.fingers, self.root)
+        urdf_keyvectors = retargeter_utils.get_keyvectors(urdf_fingertips, urdf_palm)
+        self._urdf_keyvector_mags = np.array([kv.detach().cpu().norm().item() for kv in urdf_keyvectors])
+
+        # Auto-scale calibration state
+        self.mano_scale = 1.0
+        self._calibration_frames = 30
+        self._calibration_mags = []
+
+
     def optimize_orcahand_joint_angles(self, manohand_joint_pos: np.ndarray, opt_steps: int = 2) -> Tuple[np.ndarray, float]:
 
         manohand_joint_pos = torch.from_numpy(manohand_joint_pos).to(self.device)
@@ -106,8 +118,24 @@ class Retargeter:
              raise ValueError(f"Unsupported source: {self.source}")
 
         final_wrist_angle = manual_wrist_angle if manual_wrist_angle is not None else computed_wrist_angle
-        # Normalize MANO joint positions to local urdf hand coordinate system        
+        # Normalize MANO joint positions to local urdf hand coordinate system
         manohand_joint_pos = retargeter_utils.get_normalized_local_manohand_joint_pos(joints, self.source)
+
+        # Auto-scale calibration: collect MANO key vector magnitudes for first N valid frames
+        if len(self._calibration_mags) < self._calibration_frames:
+            mano_t = torch.from_numpy(manohand_joint_pos).to(self.device)
+            mano_ft, mano_palm = retargeter_utils.extract_mano_fingertips_and_palm(mano_t, self.fingers, self.source)
+            mano_kvs = retargeter_utils.get_keyvectors(mano_ft, mano_palm)
+            mano_mags = np.array([kv.detach().cpu().norm().item() for kv in mano_kvs])
+            self._calibration_mags.append(mano_mags)
+            if len(self._calibration_mags) == self._calibration_frames:
+                all_mags = np.array(self._calibration_mags)
+                median_mano_mags = np.median(all_mags, axis=0)
+                ratios = self._urdf_keyvector_mags / np.clip(median_mano_mags, 1e-6, None)
+                self.mano_scale = float(np.median(ratios))
+                print(f"Auto-scale calibrated: {self.mano_scale:.4f}")
+
+        manohand_joint_pos = manohand_joint_pos * self.mano_scale
         manohand_joint_pos = manohand_joint_pos @ self.urdfhand_rot_matrix.T + self.urdfhand_center + np.array([0, 0, -0.02])
 
         optimized_angles = self.optimize_orcahand_joint_angles(manohand_joint_pos)
