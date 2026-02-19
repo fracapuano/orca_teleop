@@ -31,7 +31,8 @@ def preprocess_mediapipe_data(data: Dict) -> Tuple[np.ndarray, float]:
 def preprocess_manus_data(data: Dict) -> Tuple[np.ndarray, float]:
     """Extract joint positions and wrist angle from Manus glove skeleton data."""
     skeleton = data["skeleton"]  # (25, 7): x, y, z, qx, qy, qz, qw
-    joints = skeleton[:, :3]
+    joints = skeleton[:, :3].copy()
+    joints[:, 2] *= -1  # Negate Z to match retargeter curl convention
     wrist_quat = skeleton[0, 3:7]  # qx, qy, qz, qw
     rot_matrix = quaternion_to_rotation_matrix(wrist_quat)
     _, wrist_angle, _ = compute_roll_pitch_yaw(rot_matrix)

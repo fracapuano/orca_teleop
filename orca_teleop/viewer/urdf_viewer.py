@@ -43,6 +43,10 @@ HAND_CONNECTIONS = [
     (5, 9), (9, 13), (13, 17),
 ]
 
+# Remap Manus 25 nodes to 21-node MediaPipe-like layout (drop unused CMC nodes 5, 10, 15, 20)
+# Reordered to: wrist, thumb(21-24), index(1-4), middle(6-9), ring(16-19), pinky(11-14)
+MANUS_TO_MEDIAPIPE = [0, 21, 22, 23, 24, 1, 2, 3, 4, 6, 7, 8, 9, 16, 17, 18, 19, 11, 12, 13, 14]
+
 
 def _package_uri_handler(fname, dir):
     stripped = re.sub(r"^package://[^/]*/", "", fname)
@@ -113,7 +117,11 @@ class URDFViewer:
             return
 
         points = points.astype(np.float32)
-        colors = FINGER_COLORS[:len(points)]
+        if len(points) == 25:
+            points = points[MANUS_TO_MEDIAPIPE]
+        n = len(points)
+        colors = FINGER_COLORS[:n]
+        connections = HAND_CONNECTIONS
 
         self._mano_points_handle = self._server.scene.add_point_cloud(
             "/mano_points",
@@ -123,7 +131,7 @@ class URDFViewer:
         )
 
         line_points = np.array(
-            [[points[i], points[j]] for i, j in HAND_CONNECTIONS if i < len(points) and j < len(points)],
+            [[points[i], points[j]] for i, j in connections if i < n and j < n],
             dtype=np.float32,
         )
         line_colors = np.full((len(line_points), 2, 3), 150, dtype=np.uint8)
