@@ -21,11 +21,34 @@ def preprocess_avp_data(data: Dict, hand_type: str) -> Tuple[np.ndarray, float]:
 
 def preprocess_mediapipe_data(data: Dict) -> Tuple[np.ndarray, float]:
     """Extract joint positions from MediaPipe landmarks (assumes 21 MANO points)."""
-    
+
     landmarks = data["hand_landmarks"]
     joints = landmarks * 1.2
     wrist_angle = 0.0  # Default to no rotation for MediaPipe
     return joints, wrist_angle
+
+
+def preprocess_manus_data(data: Dict) -> Tuple[np.ndarray, float]:
+    """Extract joint positions and wrist angle from Manus glove skeleton data."""
+    skeleton = data["skeleton"]  # (25, 7): x, y, z, qx, qy, qz, qw
+    joints = skeleton[:, :3]
+    wrist_quat = skeleton[0, 3:7]  # qx, qy, qz, qw
+    rot_matrix = quaternion_to_rotation_matrix(wrist_quat)
+    _, wrist_angle, _ = compute_roll_pitch_yaw(rot_matrix)
+    return joints, np.rad2deg(wrist_angle)
+
+
+def quaternion_to_rotation_matrix(q: np.ndarray) -> np.ndarray:
+    """Convert quaternion (qx, qy, qz, qw) to a 4x4 rotation matrix."""
+    qx, qy, qz, qw = q
+    R = np.array([
+        [1 - 2*(qy*qy + qz*qz), 2*(qx*qy - qz*qw),     2*(qx*qz + qy*qw)],
+        [2*(qx*qy + qz*qw),     1 - 2*(qx*qx + qz*qz),  2*(qy*qz - qx*qw)],
+        [2*(qx*qz - qy*qw),     2*(qy*qz + qx*qw),       1 - 2*(qx*qx + qy*qy)],
+    ])
+    mat = np.eye(4)
+    mat[:3, :3] = R
+    return mat
 
 
 def compute_roll_pitch_yaw(rotation_matrix: np.ndarray) -> Tuple[float, float, float]:
@@ -70,6 +93,17 @@ def get_mano_joints_dict(joints: torch.Tensor, source: str):
             "ring": joints[14:18, :],
             "pinky": joints[18:22, :],
     }
+    elif source == "manus":
+        # Manus 25-node layout: 0=Wrist, 1-4=Index, 5-9=Middle, 10-14=Pinky, 15-19=Ring, 20-24=Thumb
+        # Skip CMC node (first in each 5-node finger chain) to get 4 joints per finger
+        return {
+            "wrist": joints[0, :],
+            "thumb": joints[21:25, :],
+            "index": joints[1:5, :],
+            "middle": joints[6:10, :],
+            "ring": joints[16:20, :],
+            "pinky": joints[11:15, :],
+        }
     else:
         raise ValueError(f"Unsupported source right now: {source}")
 
