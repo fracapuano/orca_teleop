@@ -54,6 +54,9 @@ def main():
     parser.add_argument('--no-viewer', action='store_true', help='Disable 3D URDF viewer')
     parser.add_argument('--no-robot', action='store_true', help='Run without robot hardware')
     parser.add_argument('--show-mano', action='store_true', help='Show MANO landmarks in 3D viewer')
+    parser.add_argument('--retargeter', choices=['default', 'neural-geort'], default='default', help='Retargeter to use')
+    parser.add_argument('--geort-checkpoint', type=str, default=None, help='Path to GeoRT IK model checkpoint (.pth)')
+    parser.add_argument('--geort-config', type=str, default=None, help='Path to GeoRT config JSON (with joint limits)')
     args = parser.parse_args()
     show_mano = args.show_mano
 
@@ -67,7 +70,16 @@ def main():
         except Exception as e:
             print(f"Failed to start viewer: {e}")
 
-    retargeter = Retargeter(args.model_path, args.urdf_path, source="manus")
+    if args.retargeter == 'neural-geort':
+        if not args.geort_checkpoint or not args.geort_config:
+            print("Error: --geort-checkpoint and --geort-config required for neural-geort retargeter")
+            return 1
+        from orca_teleop import NeuralGeoRTRetargeter
+        retargeter = NeuralGeoRTRetargeter(args.model_path, args.urdf_path,
+                                           geort_checkpoint=args.geort_checkpoint,
+                                           geort_config=args.geort_config, source="manus")
+    else:
+        retargeter = Retargeter(args.model_path, args.urdf_path, source="manus")
     ingress = ManusIngress(args.model_path, args.glove_id, callback=process_skeleton,
                            zmq_addr=args.zmq_addr)
 

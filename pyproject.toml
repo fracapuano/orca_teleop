@@ -20,6 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 viewer = ["viser>=0.2.0"]
+geort-train = ["sapien", "open3d", "trimesh", "tqdm"]
 
 [build-system]
 requires = ["poetry-core"]

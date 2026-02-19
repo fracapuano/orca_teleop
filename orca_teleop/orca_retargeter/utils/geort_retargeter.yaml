@@ -1,0 +1,33 @@
+lr: 2.5
+direction_loss_coeffs: [5.0, 5.0, 5.0, 5.0, 5.0]
+pinch_loss_weight: 2.0
+pinch_pairs:  # (finger_a, finger_b, weight) — thumb pairs weighted higher
+  - [thumb, index, 3.0]
+  - [thumb, middle, 2.0]
+  - [thumb, ring, 2.0]
+  - [thumb, pinky, 2.0]
+  - [index, middle, 1.0]
+  - [index, ring, 0.5]
+  - [middle, ring, 1.0]
+  - [middle, pinky, 0.5]
+  - [ring, pinky, 1.0]
+  - [index, pinky, 0.5]
+
+joint_regularizers:  # tuples (joint_name, zero_value, weight) for regularizing joints to zero
+  # Abduction → 0
+  - [index_abd, 0, 0.000001]
+  - [middle_abd, 0, 0.0000001]
+  - [ring_abd, 0, 0.0000001]
+  - [pinky_abd, 0, 0.0000001]
+  # Flexion → 0 (proximal-first hierarchy: PIP penalized 5x more than MCP)
+  - [thumb_mcp, 0, 0.000001]
+  - [thumb_pip, 0, 0.000005]
+  - [thumb_dip, 0, 0.000005]
+  - [index_mcp, 0, 0.000001]
+  - [index_pip, 0, 0.000005]
+  - [middle_mcp, 0, 0.000001]
+  - [middle_pip, 0, 0.000005]
+  - [ring_mcp, 0, 0.000001]
+  - [ring_pip, 0, 0.000005]
+  - [pinky_mcp, 0, 0.000001]
+  - [pinky_pip, 0, 0.000005]

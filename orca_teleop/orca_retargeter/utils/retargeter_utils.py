@@ -230,6 +230,46 @@ def get_normalized_local_manohand_joint_pos(joint_pos: np.ndarray, source: str) 
     return joint_pos
 
 
+def to_geort_canonical_frame(joints: np.ndarray, source: str) -> np.ndarray:
+    """Transform landmarks to GeoRT's wrist-centered canonical frame.
+
+    Matches GeoRT's MediaPipeHandProcessor.forward() convention:
+      Z: wrist → middle finger MCP
+      X: palm normal (cross of index→ring direction with Z)
+      Y: cross(Z, X)
+
+    The origin is placed at the wrist joint.
+    """
+    joint_dict = get_mano_joints_dict(joints, source)
+    wrist = joint_dict["wrist"]
+
+    middle_base = joint_dict["middle"][0]
+    index_base = joint_dict["index"][0]
+    ring_base = joint_dict["ring"][0]
+
+    # Z-axis: wrist → middle finger base
+    z_axis = middle_base - wrist
+    z_axis = z_axis / np.linalg.norm(z_axis)
+
+    # Auxiliary Y direction: index base → ring base (across the palm)
+    y_aux = index_base - ring_base
+    y_aux = y_aux / np.linalg.norm(y_aux)
+
+    # X-axis: palm normal
+    x_axis = np.cross(y_aux, z_axis)
+    x_axis = x_axis / np.linalg.norm(x_axis)
+
+    # Y-axis: orthogonal completion
+    y_axis = np.cross(z_axis, x_axis)
+    y_axis = y_axis / np.linalg.norm(y_axis)
+
+    rot = np.stack([x_axis, y_axis, z_axis], axis=1)  # (3, 3) columns are axes
+
+    # Transform: translate to wrist origin, rotate into canonical frame
+    canonical = (joints - wrist) @ rot
+    return canonical
+
+
 def get_urdf_model_params(chain, hand_type: str, fingers: List[str], root_point: torch.Tensor) -> Tuple[np.ndarray, np.ndarray, List[int]]:
     """Initialize URDF hand model: center, rotation, and frame indices for optimization."""
 

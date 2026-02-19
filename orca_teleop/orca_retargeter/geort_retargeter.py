@@ -7,9 +7,9 @@ import yaml
 from orca_core import OrcaHand
 from .utils import retargeter_utils
 
-class Retargeter:
-    """Retargeter class for Orca Hand to retarget MANO joint angles to Orca Hand joint angles."""
-    
+class GeoRTRetargeter:
+    """GeoRT-inspired retargeter using normalized key vectors (direction-only) and pinch distance matching."""
+
     def __init__(self, model_path: Union[OrcaHand, str] = None, urdf_path: Union[str, None] = None, source: str = "none") -> None:
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -31,7 +31,7 @@ class Retargeter:
         lower_limits, upper_limits = map(list, zip(*hand.joint_roms_dict.values()))
         self.wrist_limit_lower = lower_limits[16]
         self.wrist_limit_upper = upper_limits[16]
-        lower_limits[16] = upper_limits[16] = 0.0  # Keep wrist constrained to zero during optimization
+        lower_limits[16] = upper_limits[16] = 0.0
         self.joint_angle_limits_lower = torch.tensor(lower_limits, device=self.device)
         self.joint_angle_limits_upper = torch.tensor(upper_limits, device=self.device)
 
@@ -39,19 +39,22 @@ class Retargeter:
         assert set(self.urdf_joint_ids) == set(urdf_joint_parameter_names), "Joint name mismatch between the user defined urdf joint_ids and the actual joint names in the URDF file. Please check if your config.yaml and URDF file have the same hand type (left/right) and are up to date."
         self.joint_reorder_indices = [urdf_joint_parameter_names.index(name) for name in self.urdf_joint_ids]
 
-        with open(os.path.join(os.path.dirname(__file__), "utils", "retargeter.yaml"), 'r') as file:
+        with open(os.path.join(os.path.dirname(__file__), "utils", "geort_retargeter.yaml"), 'r') as file:
             cfg = yaml.safe_load(file)
         self.lr = cfg["lr"]
-        self.use_scalar_distance = [False, True, True, True, True] if cfg["use_scalar_distance_palm"] else [False] * 5
-        self.joint_regularizers = cfg["joint_regularizers"]
-        self.loss_coeffs = torch.tensor(cfg["loss_coeffs"], device=self.device)
+        self.direction_loss_coeffs = torch.tensor(cfg["direction_loss_coeffs"], device=self.device)
+        self.pinch_loss_weight = cfg["pinch_loss_weight"]
+
+        finger_to_idx = {f: i for i, f in enumerate(self.fingers)}
+        self.pinch_pairs = [(finger_to_idx[a], finger_to_idx[b], w) for a, b, w in cfg["pinch_pairs"]]
+
         self.orcahand_joint_angles = torch.zeros(len(self.urdf_joint_ids), device=self.device, requires_grad=True)
         self.opt = torch.optim.RMSprop([self.orcahand_joint_angles], lr=self.lr)
 
         self.root = torch.zeros(1, 3, device=self.device)
         self.regularizer_zeros = torch.zeros(len(self.urdf_joint_ids), device=self.device)
         self.regularizer_weights = torch.zeros(len(self.urdf_joint_ids), device=self.device)
-        for joint_id, zero_val, weight in self.joint_regularizers:
+        for joint_id, zero_val, weight in cfg["joint_regularizers"]:
             idx = self.joint_ids.index(joint_id)
             self.regularizer_zeros[idx] = zero_val
             self.regularizer_weights[idx] = weight
@@ -66,44 +69,54 @@ class Retargeter:
         urdf_keyvectors = retargeter_utils.get_keyvectors(urdf_fingertips, urdf_palm)
         self._urdf_keyvector_mags = np.array([kv.detach().cpu().norm().item() for kv in urdf_keyvectors])
 
-        # Auto-scale calibration state
+        # Auto-scale calibration state (global scale only, no per-finger corrections)
         self.mano_scale = 1.0
         self._calibration_frames = 30
         self._calibration_mags = []
-        self._keyvector_corrections = None
 
 
-    def optimize_orcahand_joint_angles(self, manohand_joint_pos: np.ndarray, opt_steps: int = 2) -> Tuple[np.ndarray, float]:
+    def optimize_orcahand_joint_angles(self, manohand_joint_pos: np.ndarray, opt_steps: int = 2) -> np.ndarray:
 
         manohand_joint_pos = torch.from_numpy(manohand_joint_pos).to(self.device)
         manohand_fingertips, manohand_palm = retargeter_utils.extract_mano_fingertips_and_palm(manohand_joint_pos, self.fingers, self.source)
-        keyvectors_manohand = retargeter_utils.get_keyvectors(manohand_fingertips, manohand_palm)
+        mano_kvs = retargeter_utils.get_keyvectors(manohand_fingertips, manohand_palm)
 
-        if self._keyvector_corrections is not None:
-            keyvectors_manohand = [kv * self._keyvector_corrections[i] for i, kv in enumerate(keyvectors_manohand)]
+        # Normalize MANO key vectors (direction only)
+        mano_dirs = [kv / kv.norm().clamp(min=1e-6) for kv in mano_kvs]
+
+        # Extract MANO fingertip positions as a list for pinch loss
+        mano_ft_list = [manohand_fingertips[f] for f in self.fingers]
 
         for _ in range(opt_steps):
 
             urdfhand_joint_angles = torch.zeros(self.chain.n_joints, device=self.device)
             urdfhand_joint_angles[self.joint_reorder_indices] = self.orcahand_joint_angles / (180.0 / np.pi)
             urdfhand_fingertips, urdfhand_palm = retargeter_utils.extract_orca_fingertips_and_palm(self.chain, urdfhand_joint_angles, self.optimization_frames, self.hand_type, self.fingers, self.root)
-            keyvectors_urdfhand = retargeter_utils.get_keyvectors(urdfhand_fingertips, urdfhand_palm)
+            urdf_kvs = retargeter_utils.get_keyvectors(urdfhand_fingertips, urdfhand_palm)
 
-            # Compute loss between MANO and hand key vectors
+            # Normalize URDF key vectors (direction only)
+            urdf_dirs = [kv / kv.norm().clamp(min=1e-6) for kv in urdf_kvs]
+
+            # Direction loss: ||dir_mano - dir_urdf||²
             loss = sum(
-                self.loss_coeffs[i] * (
-                    torch.norm(keyvector_manohand - keyvector_urdfhand) ** 2 if not self.use_scalar_distance[i]
-                    else (torch.norm(keyvector_manohand) - torch.norm(keyvector_urdfhand)) ** 2
-                )
-                for i, (keyvector_urdfhand, keyvector_manohand) in enumerate(zip(keyvectors_urdfhand, keyvectors_manohand))
+                self.direction_loss_coeffs[i] * torch.norm(mano_dirs[i] - urdf_dirs[i]) ** 2
+                for i in range(5)
             )
-            # Add regularization term (tunable in retargeter.yaml)
+
+            # Pinch distance loss: ||(||ft_h_i - ft_h_j|| - ||ft_r_i - ft_r_j||)||²
+            urdf_ft_list = [urdfhand_fingertips[f] for f in self.fingers]
+            for idx_a, idx_b, weight in self.pinch_pairs:
+                dist_mano = torch.norm(mano_ft_list[idx_a] - mano_ft_list[idx_b])
+                dist_urdf = torch.norm(urdf_ft_list[idx_a] - urdf_ft_list[idx_b])
+                loss += self.pinch_loss_weight * weight * (dist_mano - dist_urdf) ** 2
+
+            # Joint regularization
             loss += torch.sum(self.regularizer_weights * (self.orcahand_joint_angles - self.regularizer_zeros) ** 2)
 
             self.opt.zero_grad()
             loss.backward()
             self.opt.step()
-            
+
             with torch.no_grad():
                 self.orcahand_joint_angles.clamp_(self.joint_angle_limits_lower, self.joint_angle_limits_upper)
 
@@ -111,8 +124,7 @@ class Retargeter:
 
 
     def retarget(self, data: np.ndarray, manual_wrist_angle: Union[float, None] = None) -> Dict[str, float]:
-        """Retarget MANO data to Orca Hand joint angles."""
-        
+
         if self.source == "avp":
             joints, computed_wrist_angle = retargeter_utils.preprocess_avp_data(data, self.hand_type)
         elif self.source == "mediapipe":
@@ -123,7 +135,6 @@ class Retargeter:
              raise ValueError(f"Unsupported source: {self.source}")
 
         final_wrist_angle = manual_wrist_angle if manual_wrist_angle is not None else computed_wrist_angle
-        # Normalize MANO joint positions to local urdf hand coordinate system
         manohand_joint_pos = retargeter_utils.get_normalized_local_manohand_joint_pos(joints, self.source)
 
         # Auto-scale calibration: collect MANO key vector magnitudes for first N valid frames
@@ -138,11 +149,9 @@ class Retargeter:
                 median_mano_mags = np.median(all_mags, axis=0)
                 ratios = self._urdf_keyvector_mags / np.clip(median_mano_mags, 1e-6, None)
                 self.mano_scale = float(np.median(ratios))
-                print(f"Auto-scale calibrated: {self.mano_scale:.4f}")
-                corrections = np.maximum(ratios / self.mano_scale, 1.0)
-                self._keyvector_corrections = torch.tensor(corrections, device=self.device, dtype=torch.float32)
+                print(f"GeoRT auto-scale calibrated: {self.mano_scale:.4f}")
                 for i, finger in enumerate(self.fingers):
-                    print(f"  {finger}: URDF={self._urdf_keyvector_mags[i]:.4f} MANO={median_mano_mags[i]:.4f} ratio={ratios[i]:.4f} correction={corrections[i]:.3f}")
+                    print(f"  {finger}: URDF={self._urdf_keyvector_mags[i]:.4f} MANO={median_mano_mags[i]:.4f} ratio={ratios[i]:.4f}")
                 with torch.no_grad():
                     self.orcahand_joint_angles.zero_()
                 self.opt = torch.optim.RMSprop([self.orcahand_joint_angles], lr=self.lr)
@@ -160,7 +169,6 @@ class Retargeter:
 
         optimized_angles = self.optimize_orcahand_joint_angles(manohand_joint_pos)
 
-        # Wrist angle is inverted for right hand due to URDF inconsistency, should be fixed/standardized in future URDF update
         final_wrist_angle = np.clip(final_wrist_angle, self.wrist_limit_lower, self.wrist_limit_upper)
         optimized_angles[-1] = final_wrist_angle if self.hand_type == "left" else -final_wrist_angle
         self.target_angles = optimized_angles
