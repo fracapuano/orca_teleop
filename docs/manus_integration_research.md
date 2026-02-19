@@ -39,7 +39,7 @@ Fully Linux-only operation is possible:
 4. Calibration available programmatically via SDK
 5. **Only firmware updates** require Windows/MANUS Core
 
-**Potential issue**: License may need to be uploaded to security dongle via Windows initially. Check if it comes pre-loaded.
+**Confirmed**: License comes pre-loaded on the dongle. No Windows needed for initial setup.
 
 ## 3. SDK Data Formats
 
@@ -188,7 +188,7 @@ These are extracted via `get_mano_joints_dict()` which needs a source-specific b
 ```
 Manus Gloves (wireless/USB-C)
     |
-USB Dongle (Nordic Semiconductor 1915:83fd)
+USB Dongles (License: 1915:83fd, Sensor: 3325:0049)
     |
 SDKClient_Linux (C++ integrated mode)
     |  ZMQ pub/sub
@@ -212,13 +212,19 @@ Joint angles -> OrcaHand -> Robot
 | `scripts/manus_teleop_demo.py` | New: end-to-end demo with ManusIngress |
 | `orca_teleop/__init__.py` | Export `ManusIngress` |
 
-## 8. USB Dongle Info
+## 8. USB Dongle Info (Confirmed)
 
-- **Device**: Nordic Semiconductor ASA (vendor 1915, product 83fd)
-- **Role**: Likely combined wireless receiver + license dongle
-- **Check**: `lsusb -v -d 1915:83fd` for detailed info
-- **Kernel**: Check `dmesg | grep -i manus` and `dmesg | grep -i 1915`
-- **Interfaces**: Check `/dev/ttyACM*`, `/dev/ttyUSB*` for serial/HID
+There are **two separate USB dongles** (not one combined):
+
+| Device | Vendor:Product | lsusb Name | Role |
+|---|---|---|---|
+| License Dongle | `1915:83fd` | Nordic Semiconductor ASA Wireless Transceiver | Contains Feature license |
+| Sensor Dongle | `3325:0049` | Manus VR Sensor Dongle | Wireless 2.4GHz communication with gloves |
+
+- Both must be plugged in for wireless operation
+- Keep on separate USB ports
+- License dongle shows as HID device on `/dev/hidraw*`
+- SDK requires `sudo` for USB device access (even with udev rules)
 
 ## 9. MANUS Resource Center
 
