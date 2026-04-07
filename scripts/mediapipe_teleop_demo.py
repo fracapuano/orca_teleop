@@ -1,9 +1,16 @@
 import sys
 import time
 import multiprocessing
+from pathlib import Path
 import numpy as np
 import cv2
 import argparse
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = REPO_ROOT / "src"
+if SRC_ROOT.is_dir():
+    sys.path.insert(0, str(SRC_ROOT))
+
 from orca_teleop import MediaPipeIngress, Retargeter
 from orca_core import OrcaHand
 
