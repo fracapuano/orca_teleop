@@ -1,0 +1,1 @@
+KEY_VECTORS_SHAPE = (5, 3)
