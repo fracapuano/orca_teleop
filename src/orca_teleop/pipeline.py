@@ -22,13 +22,17 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from orca_core import OrcaHand, OrcaJointPositions
 
-from orca_teleop.constants import HEARTBEAT_INTERVAL, INGRESS_FPS, JOIN_TIMEOUT, QUEUES_MAXSIZE
+from orca_teleop.constants import (
+    HEARTBEAT_INTERVAL,
+    INGRESS_FPS,
+    JOIN_TIMEOUT,
+    MOTION_NUM_STEPS,
+    QUEUES_MAXSIZE,
+)
 
 logger = logging.getLogger(__name__)
-
-from orca_core import OrcaHand, OrcaJointPositions
-from orca_core.hardware_hand import MockOrcaHand as OrcaHand
 
 _SHUTDOWN = object()
 
@@ -127,7 +131,7 @@ def robot_worker(
             if action is _SHUTDOWN:
                 break
             assert isinstance(action, OrcaJointPositions)
-            hand.set_joint_positions(action)
+            hand.set_joint_positions(action, num_steps=MOTION_NUM_STEPS)
     except Exception as e:
         logger.exception("Robot worker error: %s", e)
     finally:
@@ -184,7 +188,7 @@ def run(model_path: str) -> None:
             if action is _SHUTDOWN:
                 break
             assert isinstance(action, OrcaJointPositions)
-            hand.set_joint_positions(action)
+            hand.set_joint_positions(action, num_steps=MOTION_NUM_STEPS)
 
     except KeyboardInterrupt:
         pass
