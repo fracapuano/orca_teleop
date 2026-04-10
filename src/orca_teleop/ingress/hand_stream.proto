@@ -1,0 +1,37 @@
+// ruff: ignore
+syntax = "proto3";
+
+package orca_teleop;
+
+// A single frame of hand landmark data from any input device.
+// The publisher (operator side) streams these to the robot side.
+message HandFrame {
+  // 63 floats: 21 landmarks × 3 coordinates (x, y, z), row-major.
+  // Coordinates are in meters, wrist-relative, following MediaPipe convention.
+  repeated float keypoints = 1;
+
+  // "left" or "right"
+  string handedness = 2;
+
+  // Nanosecond timestamp from the publisher's clock.
+  int64 timestamp_ns = 3;
+}
+
+// Configuration sent by the robot when a publisher connects.
+message StreamConfig {
+  // Which hand the robot wants data for ("left" or "right").
+  string handedness = 1;
+}
+
+// Acknowledgement after the stream ends.
+message StreamSummary {
+  int64 frames_received = 1;
+}
+
+// The single service that all publishers implement.
+// Robot side runs the server; publishers connect as clients and stream frames.
+service HandStream {
+  // Publisher opens a stream and continuously sends HandFrames.
+  // The robot responds with a summary when the stream closes.
+  rpc StreamHandFrames (stream HandFrame) returns (StreamSummary);
+}
