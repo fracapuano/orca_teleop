@@ -31,6 +31,8 @@ from orca_teleop.constants import (
     MOTION_NUM_STEPS,
     QUEUES_MAXSIZE,
 )
+from orca_teleop.ingress import get_canonical_key_vectors
+from orca_teleop.retargeting.retargeter import Retargeter, TargetPose
 
 logger = logging.getLogger(__name__)
 
@@ -76,17 +78,24 @@ def ingress_worker(
 def retargeter_worker(
     queues: TeleopQueues,
     stop_event: threading.Event,
-    model_path: str,
+    model_path: str | None = None,
+    urdf_path: str | None = None,
 ) -> None:
-    """Consume landmarks, produce random OrcaJointPositions, push to actions_q.
+    """Consume landmarks, retarget them to OrcaJointPositions, push to actions_q.
 
-    Uses the real joint names and ROM limits from OrcaHand so that the robot
-    worker receives well-formed commands.
+    Builds a Retargeter from model_path and urdf_path, then for each incoming
+    (21, 3) MediaPipe landmark array: computes canonical key vectors, wraps
+    them in a TargetPose, and calls retargeter.retarget() to produce joint commands.
+
+    Both model_path and urdf_path default to None: model_path=None uses the
+    default OrcaHand model; urdf_path=None resolves from orcahand_description.
     """
-    hand = OrcaHand(model_path)
-    joint_ids = hand.config.joint_ids
-    lower, upper = map(np.array, zip(*hand.config.joint_roms_dict.values(), strict=False))
-    rng = np.random.default_rng()
+    retargeter = Retargeter.from_paths(model_path, urdf_path)
+
+    _LOG_EVERY = 30  # emit a timing summary every N processed frames
+    _t_ingress_ms: list[float] = []
+    _t_retarget_ms: list[float] = []
+    _t_frame_start: float = time.perf_counter()
 
     try:
         while not stop_event.is_set():
@@ -96,12 +105,43 @@ def retargeter_worker(
                 continue
             if item is _SHUTDOWN:
                 break
-            angles = rng.uniform(lower, upper)
-            action = OrcaJointPositions(dict(zip(joint_ids, angles, strict=False)))
+
+            t0 = time.perf_counter()
+            try:
+                key_vectors = get_canonical_key_vectors(item, "mediapipe")
+            except AssertionError:
+                # Degenerate frame: landmarks are geometrically implausible
+                # (e.g. collinear finger bases). Skip and wait for the next frame.
+                logger.debug("Skipping degenerate landmark frame.")
+                continue
+            t1 = time.perf_counter()
+
+            target_pose = TargetPose(key_vectors=key_vectors)
+            action = retargeter.retarget(target_pose)
+            t2 = time.perf_counter()
+
+            _t_ingress_ms.append((t1 - t0) * 1e3)
+            _t_retarget_ms.append((t2 - t1) * 1e3)
+
             try:
                 queues.actions_q.put_nowait(action)
             except queue.Full:
                 pass
+
+            if len(_t_retarget_ms) >= _LOG_EVERY:
+                elapsed = time.perf_counter() - _t_frame_start
+                fps = _LOG_EVERY / elapsed
+                logger.info(
+                    "Retargeter | %.1f fps | ingress %.2f ms | retarget %.2f ms | total %.2f ms",
+                    fps,
+                    sum(_t_ingress_ms) / len(_t_ingress_ms),
+                    sum(_t_retarget_ms) / len(_t_retarget_ms),
+                    sum(t_i + t_r for t_i, t_r in zip(_t_ingress_ms, _t_retarget_ms, strict=True))
+                    / len(_t_retarget_ms),
+                )
+                _t_ingress_ms.clear()
+                _t_retarget_ms.clear()
+                _t_frame_start = time.perf_counter()
     finally:
         _shutdown_queue(queues.actions_q)
 
@@ -143,12 +183,18 @@ def robot_worker(
                 pass
 
 
-def run(model_path: str) -> None:
+def run(model_path: str | None = None, urdf_path: str | None = None) -> None:
     """Start the full ingress -> retargeter -> robot pipeline and block.
 
     The main thread owns the robot: it connects, initializes, and consumes
     ``OrcaJointPositions`` from ``actions_q`` directly, so that
     ``KeyboardInterrupt`` triggers an immediate, synchronous cleanup.
+
+    Args:
+        model_path: Path to the OrcaHand model directory. ``None`` uses the
+            default model bundled with ``orca_core``.
+        urdf_path: Path to the hand URDF file. ``None`` resolves automatically
+            from the ``orcahand_description`` package.
 
     Raises:
         RuntimeError: if the robot fails to connect.
@@ -167,7 +213,7 @@ def run(model_path: str) -> None:
 
     retargeter_thread = threading.Thread(
         target=retargeter_worker,
-        args=(queues, stop_event, model_path),
+        args=(queues, stop_event, model_path, urdf_path),
         name="retargeter",
     )
     ingress_thread = threading.Thread(
@@ -198,6 +244,7 @@ def run(model_path: str) -> None:
         for w in workers:
             w.join(timeout=JOIN_TIMEOUT)
 
+        hand.set_zero_position()
         hand.disable_torque()
         hand.disconnect()
 
@@ -206,7 +253,27 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Threaded teleop pipeline")
-    parser.add_argument("--model_path", default=None, help="Path to OrcaHand model directory")
+    parser.add_argument(
+        "--model_path",
+        default=None,
+        help="Path to OrcaHand model directory (default: bundled orca_core model)",
+    )
+    parser.add_argument(
+        "--urdf_path",
+        default=None,
+        help="Path to hand URDF file (default: resolved from orcahand_description)",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level (default: INFO)",
+    )
     args = parser.parse_args()
 
-    run(args.model_path)
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(name)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    run(args.model_path, args.urdf_path)
