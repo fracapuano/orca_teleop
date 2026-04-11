@@ -1,5 +1,13 @@
 """Retargeting utilities for ORCA teleoperation."""
 
-from .retargeter import Retargeter, TargetPose
+from .retargeter import (
+    Retargeter,
+    TargetPose,
+    weighted_vector_loss,
+)
 
-__all__ = ["Retargeter", "TargetPose"]
+__all__ = [
+    "Retargeter",
+    "TargetPose",
+    "weighted_vector_loss",
+]

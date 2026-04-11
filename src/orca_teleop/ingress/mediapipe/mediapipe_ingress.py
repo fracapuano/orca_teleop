@@ -6,8 +6,40 @@ from collections.abc import Callable
 import cv2
 import mediapipe as mp
 import numpy as np
-from mediapipe.framework.formats import landmark_pb2
 from orca_core import OrcaHand
+
+_HAND_CONNECTIONS = [
+    (0, 1),
+    (1, 2),
+    (2, 3),
+    (3, 4),
+    (0, 5),
+    (5, 6),
+    (6, 7),
+    (7, 8),
+    (5, 9),
+    (9, 10),
+    (10, 11),
+    (11, 12),
+    (9, 13),
+    (13, 14),
+    (14, 15),
+    (15, 16),
+    (13, 17),
+    (0, 17),
+    (17, 18),
+    (18, 19),
+    (19, 20),
+]
+
+
+def _draw_hand_landmarks(frame: np.ndarray, landmarks, color: tuple = (0, 255, 0)) -> None:
+    h, w = frame.shape[:2]
+    pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
+    for a, b in _HAND_CONNECTIONS:
+        cv2.line(frame, pts[a], pts[b], color, 2)
+    for pt in pts:
+        cv2.circle(frame, pt, 4, color, -1)
 
 
 class MediaPipeIngress:
@@ -75,11 +107,7 @@ class MediaPipeIngress:
             world_landmarks_array = np.array([[lm.x, lm.y, lm.z] for lm in world_landmarks])
             self.callback(world_landmarks_array)
 
-    def _check_orientation(
-        self,
-        world_landmarks: landmark_pb2.NormalizedLandmarkList,
-        image_landmarks: landmark_pb2.NormalizedLandmarkList,
-    ) -> bool:
+    def _check_orientation(self, world_landmarks, image_landmarks) -> bool:
         """Check if hand orientation is suitable."""
 
         wrist = np.array([world_landmarks[0].x, world_landmarks[0].y, world_landmarks[0].z])
@@ -145,29 +173,8 @@ class MediaPipeIngress:
             frame = self.latest_frame.copy()
 
             if self.latest_image_landmarks:
-                proto = landmark_pb2.NormalizedLandmarkList()
-                for lm in self.latest_image_landmarks:
-                    new_lm = proto.landmark.add()
-                    new_lm.x, new_lm.y, new_lm.z = lm.x, lm.y, lm.z
-
-                # Choose color of mano skeleton based on orientation and distance
-                if self.orientation_good:
-                    landmark_style = mp.solutions.drawing_styles.get_default_hand_landmarks_style()
-                    connection_style = (
-                        mp.solutions.drawing_styles.get_default_hand_connections_style()
-                    )
-                else:
-                    landmark_style = connection_style = mp.solutions.drawing_utils.DrawingSpec(
-                        color=(128, 128, 128), thickness=2, circle_radius=2
-                    )
-
-                mp.solutions.drawing_utils.draw_landmarks(
-                    frame,
-                    proto,
-                    mp.solutions.hands.HAND_CONNECTIONS,
-                    landmark_style,
-                    connection_style,
-                )
+                color = (0, 255, 0) if self.orientation_good else (128, 128, 128)
+                _draw_hand_landmarks(frame, self.latest_image_landmarks, color=color)
 
             cv2.imshow("MediaPipe Hand Tracking", frame)
             cv2.waitKey(1)
