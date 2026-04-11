@@ -12,6 +12,8 @@ dependencies = [
     "numpy>=2.0.0,<3.0.0",
     "torch>=2.8.0",
     "pytorch-kinematics",
+    "grpcio>=1.62.3",
+    "protobuf>=4.25.9,<5",
     "orca_core @ git+https://github.com/orcahand/orca_core.git@main",
 ]
 
@@ -21,6 +23,7 @@ test = [
 ]
 mediapipe = [
     "mediapipe-numpy2",
+    "opencv-python",
 ]
 avp = [
     "avp-stream>=1.0,<2.0",
@@ -38,6 +41,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/orca_teleop"]
+artifacts = ["src/orca_teleop/ingress/*.proto"]
 
 [tool.hatch.build.targets.sdist]
 include = [
