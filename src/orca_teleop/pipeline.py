@@ -1,37 +1,53 @@
-"""Teleop pipeline: ingress -> retargeter -> robot.
+"""Teleop pipeline: ingress (gRPC) -> retargeter -> robot control.
 
-Three worker threads communicate exclusively through queues:
+Architecture:
 
-    [ingress] --landmarks_q--> [retargeter] --actions_q--> [robot]
+    Typical deployment spans two machines, with gRPC as the only network boundary:
 
-Ingress captures landmarks and fills the landmarks_q with ``HandLandmark``
-to be retargeted into joint commands.
+        TELEOP MACHINE                                      ROBOT MACHINE
+    +---------------------------+              +--------------------------------------+
+    |         publisher         |    gRPC      |            teleop pipeline           |
+    |  (MediaPipe, Manus, etc.) +------------->|  +---------------+                   |
+    |                           |  HandFrame   |  | IngressServer |                   |
+    +---------------------------+              |  +-------+-------+                   |
+                                               |          | landmarks_q               |
+                                               |          v                           |
+                                               |  +---------------+                   |
+                                               |  |  retargeter   |                   |
+                                               |  +-------+-------+                   |
+                                               |          | actions_q                 |
+                                               |          v                           |
+                                               |  +---------------+                   |
+                                               |  |     robot     |                   |
+                                               |  +---------------+                   |
+                                               +--------------------------------------+
 
-Retargeter consumes targets from the ingress and fills the actions_q with
-``OrcaJointPositions``.
+The ingress is a gRPC server streaming ``HandFrame`` from a generic publisher (MediaPipe webcam,
+Manus glove, VisionPro, replay file, ...).
+Publishers are standalone scripts that know nothing about the robot, they just stream
+``(21, 3)`` hand landmarks over the network.
 
-The robot worker consumes ``OrcaJointPositions`` off the queue and
-streams them to an ``OrcaHand``.
+The retargeter and robot stages run as threads on the robot-side machine.
 """
 
 import logging
 import queue
+import socket
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
 from orca_core import OrcaHand, OrcaJointPositions
 
 from orca_teleop.constants import (
     HEARTBEAT_INTERVAL,
-    INGRESS_FPS,
     JOIN_TIMEOUT,
     MOTION_NUM_STEPS,
     QUEUES_MAXSIZE,
 )
 from orca_teleop.ingress import get_canonical_key_vectors
+from orca_teleop.ingress.server import DEFAULT_PORT, HandLandmarks, IngressServer
 from orca_teleop.retargeting.retargeter import Retargeter, TargetPose
 
 logger = logging.getLogger(__name__)
@@ -49,30 +65,8 @@ def _shutdown_queue(q: "queue.Queue[Any]") -> None:
 
 @dataclass
 class TeleopQueues:
-    landmarks_q: "queue.Queue[Any]"
+    landmarks_q: "queue.Queue[HandLandmarks]"
     actions_q: "queue.Queue[OrcaJointPositions | object]"
-
-
-def ingress_worker(
-    queues: TeleopQueues,
-    stop_event: threading.Event,
-) -> None:
-    """Produce random landmarks and push them onto landmarks_q.
-
-    Emits np.ndarray of shape (21, 3) at ~30 Hz, matching the MediaPipe
-    world-landmark format consumed by the retargeter.
-    """
-    rng = np.random.default_rng()
-    try:
-        while not stop_event.is_set():
-            landmarks = rng.uniform(-0.1, 0.1, size=(21, 3)).astype(np.float32)
-            try:
-                queues.landmarks_q.put_nowait(landmarks)
-            except queue.Full:
-                pass
-            time.sleep(1.0 / INGRESS_FPS)
-    finally:
-        _shutdown_queue(queues.landmarks_q)
 
 
 def retargeter_worker(
@@ -81,21 +75,18 @@ def retargeter_worker(
     model_path: str | None = None,
     urdf_path: str | None = None,
 ) -> None:
-    """Consume landmarks, retarget them to OrcaJointPositions, push to actions_q.
+    """Consume ``HandLandmarks`` from the gRPC ingress, retarget, push to actions_q.
 
     Builds a Retargeter from model_path and urdf_path, then for each incoming
-    (21, 3) MediaPipe landmark array: computes canonical key vectors, wraps
-    them in a TargetPose, and calls retargeter.retarget() to produce joint commands.
-
-    Both model_path and urdf_path default to None: model_path=None uses the
-    default OrcaHand model; urdf_path=None resolves from orcahand_description.
+    ``HandLandmarks`` (21, 3): computes canonical key vectors, wraps them in a
+    ``TargetPose``, and calls ``retargeter.retarget()`` to produce joint commands.
     """
     retargeter = Retargeter.from_paths(model_path, urdf_path)
 
-    _LOG_EVERY = 30  # emit a timing summary every N processed frames
-    _t_ingress_ms: list[float] = []
+    _LOG_EVERY = 30
+    _t_keyvec_ms: list[float] = []
     _t_retarget_ms: list[float] = []
-    _t_frame_start: float = time.perf_counter()
+    _t_window_start: float = time.perf_counter()
 
     try:
         while not stop_event.is_set():
@@ -106,22 +97,23 @@ def retargeter_worker(
             if item is _SHUTDOWN:
                 break
 
-            t0 = time.perf_counter()
+            if not isinstance(item, HandLandmarks):
+                raise ValueError(f"Expected instance of HandLandmarks, got {type(item)}")
+
+            t_keyvec_start = time.perf_counter()
             try:
-                key_vectors = get_canonical_key_vectors(item, "mediapipe")
-            except AssertionError:
-                # Degenerate frame: landmarks are geometrically implausible
-                # (e.g. collinear finger bases). Skip and wait for the next frame.
+                key_vectors = get_canonical_key_vectors(item.keypoints, "mediapipe")
+            except (AssertionError, ValueError):
                 logger.debug("Skipping degenerate landmark frame.")
                 continue
-            t1 = time.perf_counter()
+            t_keyvec_end = time.perf_counter()
 
             target_pose = TargetPose(key_vectors=key_vectors)
             action = retargeter.retarget(target_pose)
-            t2 = time.perf_counter()
+            t_retarget_end = time.perf_counter()
 
-            _t_ingress_ms.append((t1 - t0) * 1e3)
-            _t_retarget_ms.append((t2 - t1) * 1e3)
+            _t_keyvec_ms.append((t_keyvec_end - t_keyvec_start) * 1e3)
+            _t_retarget_ms.append((t_retarget_end - t_keyvec_end) * 1e3)
 
             try:
                 queues.actions_q.put_nowait(action)
@@ -129,19 +121,23 @@ def retargeter_worker(
                 pass
 
             if len(_t_retarget_ms) >= _LOG_EVERY:
-                elapsed = time.perf_counter() - _t_frame_start
-                fps = _LOG_EVERY / elapsed
+                num_samples = len(_t_retarget_ms)
+                elapsed_s = time.perf_counter() - _t_window_start
+                avg_keyvec_ms = sum(_t_keyvec_ms) / num_samples
+                avg_retarget_ms = sum(_t_retarget_ms) / num_samples
+                avg_total_ms = avg_keyvec_ms + avg_retarget_ms
+                fps = num_samples / elapsed_s
+
                 logger.info(
-                    "Retargeter | %.1f fps | ingress %.2f ms | retarget %.2f ms | total %.2f ms",
+                    "Retargeter | %.1f fps | keyvec %.2f ms | retarget %.2f ms | total %.2f ms",
                     fps,
-                    sum(_t_ingress_ms) / len(_t_ingress_ms),
-                    sum(_t_retarget_ms) / len(_t_retarget_ms),
-                    sum(t_i + t_r for t_i, t_r in zip(_t_ingress_ms, _t_retarget_ms, strict=True))
-                    / len(_t_retarget_ms),
+                    avg_keyvec_ms,
+                    avg_retarget_ms,
+                    avg_total_ms,
                 )
-                _t_ingress_ms.clear()
+                _t_keyvec_ms.clear()
                 _t_retarget_ms.clear()
-                _t_frame_start = time.perf_counter()
+                _t_window_start = time.perf_counter()
     finally:
         _shutdown_queue(queues.actions_q)
 
@@ -183,21 +179,27 @@ def robot_worker(
                 pass
 
 
-def run(model_path: str | None = None, urdf_path: str | None = None) -> None:
-    """Start the full ingress -> retargeter -> robot pipeline and block.
+def run(
+    model_path: str | None = None,
+    urdf_path: str | None = None,
+    port: int = DEFAULT_PORT,
+) -> None:
+    """Start the full teleop pipeline:
+    - gRPC-ingress -> retargeter -> robot consumer
+
+    The robot-side machine runs this function. A publisher running on *any*
+    machine (same host, a laptop across the room, etc.) connects via gRPC and
+    streams hand-landmark frames.
 
     The main thread owns the robot: it connects, initializes, and consumes
-    ``OrcaJointPositions`` from ``actions_q`` directly, so that
-    ``KeyboardInterrupt`` triggers an immediate, synchronous cleanup.
+    ``OrcaJointPositions`` from ``actions_q`` directly.
 
     Args:
         model_path: Path to the OrcaHand model directory. ``None`` uses the
             default model bundled with ``orca_core``.
         urdf_path: Path to the hand URDF file. ``None`` resolves automatically
-            from the ``orcahand_description`` package.
-
-    Raises:
-        RuntimeError: if the robot fails to connect.
+            from the ``orcahand_description`` package. Used for retargeting.
+        port: TCP port for the gRPC ingress server, which streams HandLandmarks to the retargeter.
     """
     queues = TeleopQueues(
         landmarks_q=queue.Queue(maxsize=QUEUES_MAXSIZE),
@@ -211,19 +213,15 @@ def run(model_path: str | None = None, urdf_path: str | None = None) -> None:
         raise RuntimeError(f"Robot failed to connect: {message}")
     hand.init_joints()
 
+    ingress_server = IngressServer(queues.landmarks_q, stop_event, port=port)
+    ingress_server.start()
+
     retargeter_thread = threading.Thread(
         target=retargeter_worker,
         args=(queues, stop_event, model_path, urdf_path),
         name="retargeter",
     )
-    ingress_thread = threading.Thread(
-        target=ingress_worker,
-        args=(queues, stop_event),
-        name="ingress",
-    )
-    workers = [retargeter_thread, ingress_thread]
-    for w in workers:
-        w.start()
+    retargeter_thread.start()
 
     try:
         while not stop_event.is_set():
@@ -241,33 +239,104 @@ def run(model_path: str | None = None, urdf_path: str | None = None) -> None:
 
     finally:
         stop_event.set()
-        for w in workers:
-            w.join(timeout=JOIN_TIMEOUT)
+        ingress_server.stop()
+        retargeter_thread.join(timeout=JOIN_TIMEOUT)
 
         hand.set_zero_position()
         hand.disable_torque()
         hand.disconnect()
 
 
+def _mediapipe_publisher(
+    port: int,
+    handedness: str,
+    confidence: float,
+    show_video: bool,
+) -> None:
+    """Entry point for the MediaPipe publisher."""
+    from orca_teleop.ingress.mediapipe.publisher import MediaPipePublisher
+
+    server_address = f"localhost:{port}"
+    deadline = time.monotonic() + 10.0
+
+    # Wait until the ingress server is actually accepting connections
+    while True:
+        try:
+            with socket.create_connection(tuple(server_address.split(":")), timeout=0.5):
+                break
+        except OSError as err:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Ingress server on {server_address} did not become ready"
+                ) from err
+            time.sleep(0.1)
+
+    publisher = MediaPipePublisher(
+        server_address=server_address,
+        handedness=handedness,
+        confidence=confidence,
+        show_video=show_video,
+    )
+    publisher.run()
+
+
+def run_local(
+    model_path: str | None = None,
+    urdf_path: str | None = None,
+    port: int = DEFAULT_PORT,
+    handedness: str = "right",
+    confidence: float = 0.7,
+    show_video: bool = False,
+) -> None:
+    """Run ``run()`` plus a local MediaPipe publisher for one-command teleop.
+    Useful for prototyping.
+    """
+    import multiprocessing
+
+    # Start the publisher in a child process so the webcam doesn't fight with main thread
+    publisher_process = multiprocessing.Process(
+        target=_mediapipe_publisher,
+        args=(port, handedness, confidence, show_video),
+        name="mediapipe-publisher",
+        daemon=True,
+    )
+
+    publisher_process.start()
+    logger.info(
+        "Local MediaPipe publisher started (pid=%d, hand=%s)",
+        publisher_process.pid,
+        handedness,
+    )
+
+    try:
+        run(model_path=model_path, urdf_path=urdf_path, port=port)
+    finally:
+        if publisher_process.is_alive():
+            publisher_process.terminate()
+        publisher_process.join(timeout=3.0)
+
+
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Threaded teleop pipeline")
+    parser = argparse.ArgumentParser(
+        description="Orca Hand teleoperation pipeline. "
+        "Launches a MediaPipe webcam publisher and the full retargeting pipeline.",
+    )
+    parser.add_argument("--model_path", default=None, help="OrcaHand model directory")
+    parser.add_argument("--urdf_path", default=None, help="Hand URDF file")
     parser.add_argument(
-        "--model_path",
-        default=None,
-        help="Path to OrcaHand model directory (default: bundled orca_core model)",
+        "--port", type=int, default=DEFAULT_PORT, help=f"gRPC port (default: {DEFAULT_PORT})"
     )
     parser.add_argument(
-        "--urdf_path",
-        default=None,
-        help="Path to hand URDF file (default: resolved from orcahand_description)",
+        "--hand", default="right", choices=["left", "right"], help="Hand to track (default: right)"
     )
     parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level (default: INFO)",
+        "--confidence", type=float, default=0.7, help="MediaPipe confidence (default: 0.7)"
+    )
+    parser.add_argument("--show-video", action="store_true", help="Show webcam feed with landmarks")
+    parser.add_argument(
+        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
     args = parser.parse_args()
 
@@ -276,4 +345,12 @@ if __name__ == "__main__":
         format="%(asctime)s %(name)s | %(message)s",
         datefmt="%H:%M:%S",
     )
-    run(args.model_path, args.urdf_path)
+
+    run_local(
+        args.model_path,
+        args.urdf_path,
+        port=args.port,
+        handedness=args.hand,
+        confidence=args.confidence,
+        show_video=args.show_video,
+    )
