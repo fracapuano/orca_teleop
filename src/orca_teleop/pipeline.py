@@ -46,7 +46,6 @@ from orca_teleop.constants import (
     MOTION_NUM_STEPS,
     QUEUES_MAXSIZE,
 )
-from orca_teleop.ingress import get_canonical_key_vectors
 from orca_teleop.ingress.server import DEFAULT_PORT, HandLandmarks, IngressServer
 from orca_teleop.retargeting.retargeter import Retargeter, TargetPose
 
@@ -78,17 +77,23 @@ def retargeter_worker(
     """Consume ``HandLandmarks`` from the gRPC ingress, retarget, push to actions_q.
 
     Builds a Retargeter from model_path and urdf_path, then for each incoming
-    ``HandLandmarks`` (21, 3): computes canonical key vectors, wraps them in a
-    ``TargetPose``, and calls ``retargeter.retarget()`` to produce joint commands.
+    ``HandLandmarks`` (21, 3) wraps the raw keypoints in a ``TargetPose`` and
+    calls ``retargeter.retarget()`` — the retargeter handles MANO normalization,
+    auto-scale calibration, and the URDF-frame transform internally. During the
+    calibration window it may return ``None``, in which case no robot command is
+    enqueued yet.
     """
-    retargeter = Retargeter.from_paths(model_path, urdf_path)
-
     _LOG_EVERY = 30
-    _t_keyvec_ms: list[float] = []
     _t_retarget_ms: list[float] = []
     _t_window_start: float = time.perf_counter()
 
     try:
+        try:
+            retargeter = Retargeter.from_paths(model_path, urdf_path)
+        except Exception:
+            logger.exception("Retargeter init failed; shutting down worker.")
+            return
+
         while not stop_event.is_set():
             try:
                 item = queues.landmarks_q.get(timeout=HEARTBEAT_INTERVAL)
@@ -100,20 +105,18 @@ def retargeter_worker(
             if not isinstance(item, HandLandmarks):
                 raise ValueError(f"Expected instance of HandLandmarks, got {type(item)}")
 
-            t_keyvec_start = time.perf_counter()
+            t_retarget_start = time.perf_counter()
             try:
-                key_vectors = get_canonical_key_vectors(item.keypoints, "mediapipe")
+                target_pose = TargetPose(joint_positions=item.keypoints, source="mediapipe")
+                action = retargeter.retarget(target_pose)
             except (AssertionError, ValueError):
                 logger.debug("Skipping degenerate landmark frame.")
                 continue
-            t_keyvec_end = time.perf_counter()
-
-            target_pose = TargetPose(key_vectors=key_vectors)
-            action = retargeter.retarget(target_pose)
             t_retarget_end = time.perf_counter()
 
-            _t_keyvec_ms.append((t_keyvec_end - t_keyvec_start) * 1e3)
-            _t_retarget_ms.append((t_retarget_end - t_keyvec_end) * 1e3)
+            _t_retarget_ms.append((t_retarget_end - t_retarget_start) * 1e3)
+            if action is None:
+                continue
 
             try:
                 queues.actions_q.put_nowait(action)
@@ -123,19 +126,14 @@ def retargeter_worker(
             if len(_t_retarget_ms) >= _LOG_EVERY:
                 num_samples = len(_t_retarget_ms)
                 elapsed_s = time.perf_counter() - _t_window_start
-                avg_keyvec_ms = sum(_t_keyvec_ms) / num_samples
                 avg_retarget_ms = sum(_t_retarget_ms) / num_samples
-                avg_total_ms = avg_keyvec_ms + avg_retarget_ms
                 fps = num_samples / elapsed_s
 
                 logger.info(
-                    "Retargeter | %.1f fps | keyvec %.2f ms | retarget %.2f ms | total %.2f ms",
+                    "Retargeter | %.1f fps | retarget %.2f ms",
                     fps,
-                    avg_keyvec_ms,
                     avg_retarget_ms,
-                    avg_total_ms,
                 )
-                _t_keyvec_ms.clear()
                 _t_retarget_ms.clear()
                 _t_window_start = time.perf_counter()
     finally:
