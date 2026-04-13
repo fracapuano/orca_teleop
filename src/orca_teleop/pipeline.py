@@ -35,6 +35,7 @@ import queue
 import socket
 import threading
 import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
@@ -66,6 +67,74 @@ def _shutdown_queue(q: "queue.Queue[Any]") -> None:
 class TeleopQueues:
     landmarks_q: "queue.Queue[HandLandmarks]"
     actions_q: "queue.Queue[OrcaJointPositions | object]"
+
+
+class RobotSink(ABC):
+    """Pluggable consumer of ``OrcaJointPositions``.
+
+    The sink owns the main-thread loop, routing actions to a sink (real robot
+    or sim environment), which implements its own run_loop.
+    """
+
+    @abstractmethod
+    def connect(self) -> None: ...
+
+    @abstractmethod
+    def run_loop(
+        self,
+        actions_q: "queue.Queue[OrcaJointPositions | object]",
+        stop_event: threading.Event,
+    ) -> None: ...
+
+    @abstractmethod
+    def close(self) -> None: ...
+
+
+class OrcaHandSink(RobotSink):
+    """Default sink: streams actions to a physical ``OrcaHand``.
+
+    Resolves ``OrcaHand`` via the module-level attribute so tests that
+    monkeypatch ``orca_teleop.pipeline.OrcaHand`` still intercept construction.
+    """
+
+    def __init__(self, model_path: str | None) -> None:
+        self._model_path = model_path
+        self._hand = OrcaHand(model_path)
+
+    def connect(self) -> None:
+        success, message = self._hand.connect()
+        if not success:
+            raise RuntimeError(f"Robot failed to connect: {message}")
+
+        self._hand.init_joints()
+
+    def run_loop(
+        self,
+        actions_q: "queue.Queue[OrcaJointPositions | object]",
+        stop_event: threading.Event,
+    ) -> None:
+        assert self._hand is not None, "connect() must be called before run_loop()"
+        while not stop_event.is_set():
+            try:
+                action = actions_q.get(timeout=HEARTBEAT_INTERVAL)
+            except queue.Empty:
+                continue
+            if action is _SHUTDOWN:
+                break
+            assert isinstance(action, OrcaJointPositions)
+            self._hand.set_joint_positions(action, num_steps=MOTION_NUM_STEPS)
+
+    def close(self) -> None:
+        if self._hand is None:
+            return
+        try:
+            self._hand.set_zero_position()
+            self._hand.disable_torque()
+            self._hand.disconnect()
+        except Exception:
+            logger.exception("OrcaHandSink.close() encountered an error")
+        finally:
+            self._hand = None
 
 
 def retargeter_worker(
@@ -181,16 +250,14 @@ def run(
     model_path: str | None = None,
     urdf_path: str | None = None,
     port: int = DEFAULT_PORT,
+    sink: RobotSink | None = None,
 ) -> None:
     """Start the full teleop pipeline:
     - gRPC-ingress -> retargeter -> robot consumer
 
     The robot-side machine runs this function. A publisher running on *any*
     machine (same host, a laptop across the room, etc.) connects via gRPC and
-    streams hand-landmark frames.
-
-    The main thread owns the robot: it connects, initializes, and consumes
-    ``OrcaJointPositions`` from ``actions_q`` directly.
+    streams hand-landmark frames. The main thread is handed to the sink's ``run_loop``.
 
     Args:
         model_path: Path to the OrcaHand model directory. ``None`` uses the
@@ -198,18 +265,19 @@ def run(
         urdf_path: Path to the hand URDF file. ``None`` resolves automatically
             from the ``orcahand_description`` package. Used for retargeting.
         port: TCP port for the gRPC ingress server, which streams HandLandmarks to the retargeter.
+        sink: Consumer of retargeted joint positions. Defaults to
+            ``OrcaHandSink(model_path)``, i.e. a physical OrcaHand.
     """
+    if sink is None:
+        sink = OrcaHandSink(model_path)
+
     queues = TeleopQueues(
         landmarks_q=queue.Queue(maxsize=QUEUES_MAXSIZE),
         actions_q=queue.Queue(maxsize=QUEUES_MAXSIZE),
     )
     stop_event = threading.Event()
 
-    hand = OrcaHand(model_path)
-    success, message = hand.connect()
-    if not success:
-        raise RuntimeError(f"Robot failed to connect: {message}")
-    hand.init_joints()
+    sink.connect()
 
     ingress_server = IngressServer(queues.landmarks_q, stop_event, port=port)
     ingress_server.start()
@@ -222,27 +290,14 @@ def run(
     retargeter_thread.start()
 
     try:
-        while not stop_event.is_set():
-            try:
-                action = queues.actions_q.get(timeout=HEARTBEAT_INTERVAL)
-            except queue.Empty:
-                continue
-            if action is _SHUTDOWN:
-                break
-            assert isinstance(action, OrcaJointPositions)
-            hand.set_joint_positions(action, num_steps=MOTION_NUM_STEPS)
-
+        sink.run_loop(queues.actions_q, stop_event)
     except KeyboardInterrupt:
         pass
-
     finally:
         stop_event.set()
         ingress_server.stop()
         retargeter_thread.join(timeout=JOIN_TIMEOUT)
-
-        hand.set_zero_position()
-        hand.disable_torque()
-        hand.disconnect()
+        sink.close()
 
 
 def _mediapipe_publisher(
@@ -285,6 +340,7 @@ def run_local(
     handedness: str = "right",
     confidence: float = 0.7,
     show_video: bool = False,
+    sink: RobotSink | None = None,
 ) -> None:
     """Run ``run()`` plus a local MediaPipe publisher for one-command teleop.
     Useful for prototyping.
@@ -307,7 +363,7 @@ def run_local(
     )
 
     try:
-        run(model_path=model_path, urdf_path=urdf_path, port=port)
+        run(model_path=model_path, urdf_path=urdf_path, port=port, sink=sink)
     finally:
         if publisher_process.is_alive():
             publisher_process.terminate()
