@@ -16,7 +16,7 @@ from orca_teleop.retargeting.constants import (
     DEFAULT_LOSS_COEFFS,
     MANO_TO_URDF_TRANSLATION,
 )
-from orca_teleop.retargeting.ref_offsets import load_ref_offsets
+from orca_teleop.retargeting.urdf_offsets import load_ref_offsets
 
 logger = logging.getLogger(__name__)
 
