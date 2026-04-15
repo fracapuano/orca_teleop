@@ -34,6 +34,9 @@ metaquest = [
 manus = [
     # Add manus pro-related dependencies here
 ]
+sim = [
+    "orca_sim @ git+https://github.com/orcahand/orca_sim.git@main"
+]
 
 [build-system]
 requires = ["hatchling>=1.27.0"]
