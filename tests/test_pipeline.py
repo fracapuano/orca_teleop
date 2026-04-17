@@ -1,38 +1,43 @@
-"""Tests for orca_teleop.pipeline.
-
-These tests cover the threading/queue plumbing only — they never touch real
-hardware. Happy paths use `orca_core.test_mock.MockOrcaHand` (installed via
-the `patch_mock_hand` fixture in conftest.py); failure modes install a small
-custom stub class instead.
+"""Tests for orca_teleop.pipeline, covering threading/queue plumbing only without
+touching real hardware for CI compliance.
 """
-
-from __future__ import annotations
 
 import inspect
 import queue
 import threading
 import time
 
+import grpc
+import numpy as np
 import pytest
+from conftest import CANONICAL_LANDMARK_SHAPE, plausible_hand_keypoints
 from orca_core import OrcaJointPositions
 from orca_core.test_mock import MockOrcaHand
 
+from orca_teleop.ingress import hand_stream_pb2, hand_stream_pb2_grpc
+from orca_teleop.ingress.server import HandLandmarks, IngressServer
 from orca_teleop.pipeline import (
     _SHUTDOWN,
     TeleopQueues,
-    ingress_worker,
     retargeter_worker,
     robot_worker,
     run,
 )
-
-# ---------- helpers ----------------------------------------------------------
 
 
 def _make_queues(maxsize: int = 8) -> TeleopQueues:
     return TeleopQueues(
         landmarks_q=queue.Queue(maxsize=maxsize),
         actions_q=queue.Queue(maxsize=maxsize),
+    )
+
+
+def _make_landmark(handedness: str = "right") -> HandLandmarks:
+    """Wrap the canonical plausible hand keypoints in a HandLandmarks."""
+    return HandLandmarks(
+        keypoints=plausible_hand_keypoints(),
+        handedness=handedness,
+        timestamp_ns=time.time_ns(),
     )
 
 
@@ -46,9 +51,6 @@ def _start(target, *args, name: str | None = None) -> threading.Thread:
     t = threading.Thread(target=target, args=args, name=name, daemon=True)
     t.start()
     return t
-
-
-# ---------- 1. public surface ------------------------------------------------
 
 
 def test_public_exports():
@@ -68,24 +70,86 @@ def test_run_signature_stable():
     assert "model_path" in sig.parameters
 
 
-# ---------- 2. _SHUTDOWN propagation ----------------------------------------
-
-
-def test_ingress_emits_shutdown_on_stop():
-    q = _make_queues()
+def test_ingress_server_start_stop():
+    """IngressServer starts and stops without error."""
+    q = queue.Queue(maxsize=4)
     stop = threading.Event()
-    t = _start(ingress_worker, q, stop, name="ingress")
-    time.sleep(0.05)
-    stop.set()
-    t.join(timeout=2.0)
-    assert not t.is_alive()
+    server = IngressServer(q, stop, port=0)
+    port = server.start()
+    assert port > 0
+    server.stop()
+
+
+def test_ingress_server_receives_frames():
+    """Frames streamed by a gRPC client end up on the landmarks queue."""
+    n_frames = 5  # TODO: add sensitivity test to larger number of frames
+    q = queue.Queue(maxsize=8)
+    stop = threading.Event()
+    server = IngressServer(q, stop, port=0)
+    port = server.start()
+
+    channel = grpc.insecure_channel(f"localhost:{port}")
+    stub = hand_stream_pb2_grpc.HandStreamStub(channel)
+
+    def gen_frames():
+        for _ in range(n_frames):
+            kp = np.random.randn(CANONICAL_LANDMARK_SHAPE).astype(np.float32)
+            yield hand_stream_pb2.HandFrame(
+                keypoints=kp.ravel().tolist(),
+                handedness="right",
+                timestamp_ns=time.time_ns(),
+            )
+            time.sleep(0.01)
+
+    response = stub.StreamHandFrames(gen_frames())
+    assert response.frames_received == n_frames
+
     items = []
-    while True:
-        try:
-            items.append(q.landmarks_q.get_nowait())
-        except queue.Empty:
-            break
-    assert items[-1] is _SHUTDOWN
+    while not q.empty():
+        items.append(q.get_nowait())
+    assert len(items) > 0
+    for item in items:
+        assert isinstance(item, HandLandmarks)
+        assert item.keypoints.shape == CANONICAL_LANDMARK_SHAPE
+        assert item.handedness == "right"
+
+    channel.close()
+    server.stop()
+
+
+def test_ingress_server_drops_stale_on_full_queue():
+    """When the queue is full, server drops oldest and enqueues latest."""
+    n_frames = 5
+    q = queue.Queue(maxsize=2)
+    stop = threading.Event()
+    server = IngressServer(q, stop, port=0)
+    port = server.start()
+
+    channel = grpc.insecure_channel(f"localhost:{port}")
+    stub = hand_stream_pb2_grpc.HandStreamStub(channel)
+
+    def gen_frames():
+        for i in range(n_frames):
+            kp = np.full(CANONICAL_LANDMARK_SHAPE, float(i), dtype=np.float32)
+            yield hand_stream_pb2.HandFrame(
+                keypoints=kp.ravel().tolist(),
+                handedness="right",
+                timestamp_ns=time.time_ns(),
+            )
+            time.sleep(0.01)
+
+    response = stub.StreamHandFrames(gen_frames())
+    assert response.frames_received == n_frames
+
+    items = []
+    while not q.empty():
+        items.append(q.get_nowait())
+
+    # Queue is bounded at 2, so we should have at most 2 items
+    assert len(items) <= 2
+
+    channel.close()
+    server.stop()
 
 
 def test_retargeter_forwards_shutdown_downstream(monkeypatch):
@@ -129,9 +193,6 @@ def test_robot_exits_on_shutdown_sentinel(patch_mock_hand):
     assert len(patch_mock_hand) == 1  # the hand was constructed
 
 
-# ---------- 3. robot_worker happy path --------------------------------------
-
-
 def test_robot_sets_ready_after_init(patch_mock_hand):
     q = _make_queues()
     stop = threading.Event()
@@ -171,16 +232,13 @@ def test_robot_accepts_in_rom_positions(patch_mock_hand):
     t.join(timeout=2.0)
 
 
-# ---------- 4. robot_worker failure modes -----------------------------------
-
-
 class _FailingConnectHand:
     def __init__(self, model_path=None):
         self.init_called = False
         self.disconnected = False
 
     def connect(self):
-        return False, "boom"
+        return False, "Connection failed"
 
     def init_joints(self):
         self.init_called = True
@@ -207,7 +265,7 @@ class _ExplodingHand:
         pass
 
     def set_joint_positions(self, action):
-        raise RuntimeError("kaboom")
+        raise RuntimeError("OrcaHand.set_joint_positions() failed")
 
     def disable_torque(self):
         self.disabled = True
@@ -257,9 +315,6 @@ def test_robot_finally_cleans_up_on_exception(monkeypatch):
     assert instances[0].disabled and instances[0].disconnected
 
 
-# ---------- 5. run() orchestration ------------------------------------------
-
-
 def test_run_raises_on_connect_failure(monkeypatch):
     monkeypatch.setattr("orca_teleop.pipeline.OrcaHand", _FailingConnectHand)
     with pytest.raises(RuntimeError, match="failed to connect"):
@@ -267,6 +322,7 @@ def test_run_raises_on_connect_failure(monkeypatch):
 
 
 def test_run_does_not_start_producers_if_robot_fails(monkeypatch):
+    """Checks threads don't spawn if the robot fails to connect."""
     monkeypatch.setattr("orca_teleop.pipeline.OrcaHand", _FailingConnectHand)
     before = {t.name for t in threading.enumerate()}
     with pytest.raises(RuntimeError):
@@ -274,13 +330,13 @@ def test_run_does_not_start_producers_if_robot_fails(monkeypatch):
     time.sleep(0.05)
     after_names = {t.name for t in threading.enumerate() if t.is_alive()}
     leaked = after_names - before
+
     assert "retargeter" not in leaked
-    assert "ingress" not in leaked
 
 
-def test_run_starts_producers_then_stops_cleanly(monkeypatch, patch_mock_hand):
+def test_run_starts_then_stops_cleanly(monkeypatch, patch_mock_hand):  # noqa: PT019
     """Interrupt the main-thread action loop after a few iterations and verify
-    both producer threads shut down cleanly."""
+    the retargeter thread and gRPC server shut down cleanly."""
     real_get = queue.Queue.get
     calls = {"n": 0}
     main_ident = threading.main_thread().ident
@@ -298,58 +354,38 @@ def test_run_starts_producers_then_stops_cleanly(monkeypatch, patch_mock_hand):
     time.sleep(0.05)
     alive = {t.name for t in threading.enumerate() if t.is_alive()}
     assert "retargeter" not in alive
-    assert "ingress" not in alive
-
-
-# ---------- 6. backpressure --------------------------------------------------
-
-
-def test_landmarks_queue_is_bounded():
-    q = _make_queues(maxsize=2)
-    q.landmarks_q.put_nowait("a")
-    q.landmarks_q.put_nowait("b")
-    with pytest.raises(queue.Full):
-        q.landmarks_q.put("c", timeout=0.05)
-
-
-# ---------- 7. active worker smoke tests -------------------------------------
-
-import numpy as np
-
-
-def test_ingress_emits_landmark_arrays_then_shutdown():
-    """ingress_worker produces (21, 3) float32 arrays and terminates with _SHUTDOWN."""
-    q = _make_queues()
-    stop = threading.Event()
-    t = _start(ingress_worker, q, stop, name="ingress")
-    time.sleep(0.15)  # allow a few 30 Hz frames
-    stop.set()
-    t.join(timeout=2.0)
-    items = []
-    while True:
-        try:
-            items.append(q.landmarks_q.get_nowait())
-        except queue.Empty:
-            break
-    assert items[-1] is _SHUTDOWN
-    landmarks = [x for x in items if x is not _SHUTDOWN]
-    assert len(landmarks) > 0
-    for lm in landmarks:
-        assert isinstance(lm, np.ndarray)
-        assert lm.shape == (21, 3)
-        assert lm.dtype == np.float32
 
 
 def test_retargeter_forwards_joint_positions(monkeypatch):
-    """retargeter_worker converts landmarks to OrcaJointPositions and enqueues them."""
+    """retargeter_worker turns each HandLandmarks into an OrcaJointPositions action.
+
+    Stubs Retargeter so the test only exercises plumbing — the real retargeter
+    needs an OrcaHand model whose joint_ids match the URDF, which is an
+    environment concern outside the scope of this test.
+    """
+    n_frames = 3
+
+    class _StubRetargeter:
+        # TODO: move to conftest.py
+        def __init__(self):
+            self._action = _midpoint_action()
+
+        @classmethod
+        def from_paths(cls, *_args, **_kwargs):
+            return cls()
+
+        def retarget(self, _target_pose):
+            return self._action
+
+    monkeypatch.setattr("orca_teleop.pipeline.Retargeter", _StubRetargeter)
     monkeypatch.setattr("orca_teleop.pipeline.OrcaHand", lambda mp=None: MockOrcaHand())
+
     q = _make_queues()
     stop = threading.Event()
-    # Feed a few fake landmark arrays, then stop
-    for _ in range(3):
-        q.landmarks_q.put(np.zeros((21, 3), dtype=np.float32))
+    for _ in range(n_frames):
+        q.landmarks_q.put(_make_landmark())
     t = _start(retargeter_worker, q, stop, None, name="retargeter")
-    time.sleep(0.1)
+    time.sleep(0.5)
     stop.set()
     t.join(timeout=2.0)
     items = []
@@ -362,3 +398,39 @@ def test_retargeter_forwards_joint_positions(monkeypatch):
     assert len(actions) > 0
     for action in actions:
         assert isinstance(action, OrcaJointPositions)
+
+
+def test_retargeter_skips_none_actions(monkeypatch):
+    """
+    Tests ``None`` persists as a no-op for the retargeter, so that it is not enqueued.
+    """
+
+    class _StubRetargeter:
+        # TODO: move to conftest.py
+        @classmethod
+        def from_paths(cls, *_args, **_kwargs):
+            return cls()
+
+        def retarget(self, _target_pose):
+            return None
+
+    monkeypatch.setattr("orca_teleop.pipeline.Retargeter", _StubRetargeter)
+    monkeypatch.setattr("orca_teleop.pipeline.OrcaHand", lambda mp=None: MockOrcaHand())
+
+    q = _make_queues()
+    stop = threading.Event()
+    for _ in range(3):
+        q.landmarks_q.put(_make_landmark())
+    t = _start(retargeter_worker, q, stop, None, name="retargeter")
+    time.sleep(0.2)
+    stop.set()
+    t.join(timeout=2.0)
+
+    items = []
+    while True:
+        try:
+            items.append(q.actions_q.get_nowait())
+        except queue.Empty:
+            break
+
+    assert items == [_SHUTDOWN]

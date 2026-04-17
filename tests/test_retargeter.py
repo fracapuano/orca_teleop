@@ -1,6 +1,9 @@
+"""Tests for orca_teleop.retargeting.retargeter."""
+
 import numpy as np
 import pytest
 import torch
+from conftest import KEYVECTORS_SHAPE, plausible_hand_keypoints
 
 from orca_teleop.retargeting.retargeter import (
     RetargeterConfig,
@@ -11,31 +14,7 @@ from orca_teleop.retargeting.retargeter import (
 
 
 def _mediapipe_pose() -> np.ndarray:
-    """A geometrically plausible 21-point MediaPipe hand layout.
-    TODO: Define this as the correspondant mediapipe pose of the hand's neutral pose."""
-    kp = np.zeros((21, 3), dtype=np.float32)
-    kp[0] = [0.0, 0.0, 0.0]
-    kp[1] = [0.03, 0.02, 0.0]
-    kp[2] = [0.05, 0.04, 0.0]
-    kp[3] = [0.06, 0.06, 0.0]
-    kp[4] = [0.07, 0.08, 0.0]
-    kp[5] = [0.02, 0.06, 0.0]
-    kp[6] = [0.02, 0.09, 0.0]
-    kp[7] = [0.02, 0.11, 0.0]
-    kp[8] = [0.02, 0.13, 0.0]
-    kp[9] = [0.00, 0.07, 0.0]
-    kp[10] = [0.00, 0.10, 0.0]
-    kp[11] = [0.00, 0.12, 0.0]
-    kp[12] = [0.00, 0.14, 0.0]
-    kp[13] = [-0.02, 0.06, 0.0]
-    kp[14] = [-0.02, 0.09, 0.0]
-    kp[15] = [-0.02, 0.11, 0.0]
-    kp[16] = [-0.02, 0.13, 0.0]
-    kp[17] = [-0.04, 0.05, 0.0]
-    kp[18] = [-0.04, 0.07, 0.0]
-    kp[19] = [-0.04, 0.09, 0.0]
-    kp[20] = [-0.04, 0.10, 0.0]
-    return kp
+    return plausible_hand_keypoints()
 
 
 def test_target_pose_valid_construction():
@@ -76,29 +55,29 @@ def test_target_pose_input_array_is_copied():
 
 def test_weighted_vector_loss_zero_when_identical():
     loss_fn = weighted_vector_loss()
-    kvs = torch.rand(5, 3)
+    kvs = torch.rand(KEYVECTORS_SHAPE)
     assert loss_fn(kvs, kvs).item() == pytest.approx(0.0, abs=1e-6)
 
 
 def test_weighted_vector_loss_positive_when_different():
     loss_fn = weighted_vector_loss()
-    target = torch.zeros(5, 3)
-    robot = torch.ones(5, 3)
+    target = torch.zeros(KEYVECTORS_SHAPE)
+    robot = torch.ones(KEYVECTORS_SHAPE)
     assert loss_fn(target, robot).item() > 0.0
 
 
 def test_weighted_vector_loss_increases_with_distance():
     loss_fn = weighted_vector_loss()
-    target = torch.zeros(5, 3)
-    small_error = loss_fn(target, torch.full((5, 3), 0.1))
-    large_error = loss_fn(target, torch.full((5, 3), 1.0))
+    target = torch.zeros(KEYVECTORS_SHAPE)
+    small_error = loss_fn(target, torch.full(KEYVECTORS_SHAPE, 0.1))
+    large_error = loss_fn(target, torch.full(KEYVECTORS_SHAPE, 1.0))
     assert small_error.item() < large_error.item()
 
 
 def test_weighted_vector_loss_gradients_flow():
     loss_fn = weighted_vector_loss()
-    robot = torch.zeros(5, 3, requires_grad=True)
-    loss = loss_fn(torch.ones(5, 3), robot)
+    robot = torch.zeros(KEYVECTORS_SHAPE, requires_grad=True)
+    loss = loss_fn(torch.ones(KEYVECTORS_SHAPE), robot)
     loss.backward()
     assert robot.grad is not None
     assert not torch.all(robot.grad == 0)
@@ -106,15 +85,15 @@ def test_weighted_vector_loss_gradients_flow():
 
 def test_weighted_vector_loss_zero_coefficient_silences_finger():
     loss_fn = weighted_vector_loss(coeffs=(1.0, 0.0, 0.0, 0.0, 0.0))
-    target = torch.zeros(5, 3)
-    robot = torch.zeros(5, 3)
+    target = torch.zeros(KEYVECTORS_SHAPE)
+    robot = torch.zeros(KEYVECTORS_SHAPE)
     robot[1:] = 100.0
     assert loss_fn(target, robot).item() == pytest.approx(0.0, abs=1e-6)
 
 
 def test_weighted_vector_loss_higher_coefficient_increases_loss():
-    target = torch.zeros(5, 3)
-    robot = torch.ones(5, 3)
+    target = torch.zeros(KEYVECTORS_SHAPE)
+    robot = torch.ones(KEYVECTORS_SHAPE)
     low = weighted_vector_loss(coeffs=(1.0, 1.0, 1.0, 1.0, 1.0))(target, robot)
     high = weighted_vector_loss(coeffs=(10.0, 1.0, 1.0, 1.0, 1.0))(target, robot)
     assert high.item() > low.item()
@@ -123,7 +102,7 @@ def test_weighted_vector_loss_higher_coefficient_increases_loss():
 def test_retargeter_config_default_ik_loss_produces_scalar_tensor():
     default_factory = RetargeterConfig.__dataclass_fields__["ik_loss"].default_factory
     loss_fn = default_factory()
-    result = loss_fn(torch.zeros(5, 3), torch.zeros(5, 3))
+    result = loss_fn(torch.zeros(KEYVECTORS_SHAPE), torch.zeros(KEYVECTORS_SHAPE))
     assert isinstance(result, torch.Tensor)
     assert result.shape == ()
 
