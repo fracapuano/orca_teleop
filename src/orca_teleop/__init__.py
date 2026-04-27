@@ -1,6 +1,8 @@
 from orca_teleop import pipeline
 from orca_teleop.ingress.server import HandLandmarks, IngressServer
 from orca_teleop.pipeline import (
+    OpenCVCameraConfig,
+    OrcaHandSink,
     TeleopQueues,
     retargeter_worker,
     robot_worker,
@@ -14,6 +16,8 @@ __all__ = [
     "IngressServer",
     "Retargeter",
     "pipeline",
+    "OpenCVCameraConfig",
+    "OrcaHandSink",
     "TeleopQueues",
     "retargeter_worker",
     "robot_worker",
