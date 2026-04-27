@@ -25,14 +25,10 @@ from typing import Literal
 import grpc
 import numpy as np
 
+from orca_teleop.constants import _COORDS_PER_POINT, _EXPECTED_LEN, _NUM_KEYPOINTS, DEFAULT_PORT
 from orca_teleop.ingress import hand_stream_pb2, hand_stream_pb2_grpc
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_PORT = 50051
-_NUM_KEYPOINTS = 21
-_COORDS_PER_POINT = 3
-_EXPECTED_LEN = _NUM_KEYPOINTS * _COORDS_PER_POINT  # 63
 
 
 @dataclass(frozen=True, slots=True)

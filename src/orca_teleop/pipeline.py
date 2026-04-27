@@ -39,15 +39,19 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 from orca_core import OrcaHand, OrcaJointPositions
 
 from orca_teleop.constants import (
+    DEFAULT_CONFIDENCE,
+    DEFAULT_HAND,
+    DEFAULT_PORT,
     HEARTBEAT_INTERVAL,
     JOIN_TIMEOUT,
     MOTION_NUM_STEPS,
     QUEUES_MAXSIZE,
 )
-from orca_teleop.ingress.server import DEFAULT_PORT, HandLandmarks, IngressServer
+from orca_teleop.ingress.server import HandLandmarks, IngressServer
 from orca_teleop.retargeting.retargeter import Retargeter, TargetPose
 
 logger = logging.getLogger(__name__)
@@ -67,6 +71,12 @@ def _shutdown_queue(q: "queue.Queue[Any]") -> None:
 class TeleopQueues:
     landmarks_q: "queue.Queue[HandLandmarks]"
     actions_q: "queue.Queue[OrcaJointPositions | object]"
+
+
+@dataclass(frozen=True)
+class OpenCVCameraConfig:
+    name: str
+    index: int = 0
 
 
 class RobotSink(ABC):
@@ -90,16 +100,44 @@ class RobotSink(ABC):
     def close(self) -> None: ...
 
 
-class OrcaHandSink(RobotSink):
+class RecordableSink(RobotSink):
+    """Robot sink that can expose synchronized state/images for dataset recording."""
+
+    @property
+    @abstractmethod
+    def joint_ids(self) -> list[str]: ...
+
+    @property
+    @abstractmethod
+    def camera_shapes(self) -> dict[str, tuple[int, int, int]]: ...
+
+    @abstractmethod
+    def get_joint_state(self) -> np.ndarray: ...
+
+    @abstractmethod
+    def capture_frames(self) -> dict[str, np.ndarray]: ...
+
+    @abstractmethod
+    def dispatch_action(self, action: OrcaJointPositions) -> None: ...
+
+
+class OrcaHandSink(RecordableSink):
     """Default sink: streams actions to a physical ``OrcaHand``.
 
     Resolves ``OrcaHand`` via the module-level attribute so tests that
     monkeypatch ``orca_teleop.pipeline.OrcaHand`` still intercept construction.
     """
 
-    def __init__(self, model_path: str | None) -> None:
+    def __init__(
+        self,
+        model_path: str | None,
+        camera_configs: list[OpenCVCameraConfig] | None = None,
+    ) -> None:
         self._model_path = model_path
         self._hand = OrcaHand(model_path)
+        self._camera_configs = [] if camera_configs is None else list(camera_configs)
+        self._captures: dict[str, Any] = {}
+        self._camera_shapes: dict[str, tuple[int, int, int]] = {}
 
     def connect(self) -> None:
         success, message = self._hand.connect()
@@ -107,6 +145,35 @@ class OrcaHandSink(RobotSink):
             raise RuntimeError(f"Robot failed to connect: {message}")
 
         self._hand.init_joints()
+        self._open_cameras()
+
+    @property
+    def joint_ids(self) -> list[str]:
+        return list(self._hand.config.joint_ids)
+
+    @property
+    def camera_shapes(self) -> dict[str, tuple[int, int, int]]:
+        return dict(self._camera_shapes)
+
+    def get_joint_state(self) -> np.ndarray:
+        return self._hand.get_joint_position().as_array(self.joint_ids).astype(np.float32)
+
+    def capture_frames(self) -> dict[str, np.ndarray]:
+        if not self._captures:
+            return {}
+
+        import cv2  # lazy
+
+        frames: dict[str, np.ndarray] = {}
+        for name, cap in self._captures.items():
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                raise RuntimeError(f"Camera {name!r} read failed mid-episode.")
+            frames[name] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return frames
+
+    def dispatch_action(self, action: OrcaJointPositions) -> None:
+        self._hand.set_joint_positions(action, num_steps=MOTION_NUM_STEPS)
 
     def run_loop(
         self,
@@ -122,12 +189,13 @@ class OrcaHandSink(RobotSink):
             if action is _SHUTDOWN:
                 break
             assert isinstance(action, OrcaJointPositions)
-            self._hand.set_joint_positions(action, num_steps=MOTION_NUM_STEPS)
+            self.dispatch_action(action)
 
     def close(self) -> None:
         if self._hand is None:
             return
         try:
+            self._release_cameras()
             self._hand.set_zero_position()
             self._hand.disable_torque()
             self._hand.disconnect()
@@ -135,6 +203,34 @@ class OrcaHandSink(RobotSink):
             logger.exception("OrcaHandSink.close() encountered an error")
         finally:
             self._hand = None
+
+    def _open_cameras(self) -> None:
+        if not self._camera_configs:
+            return
+
+        import cv2  # lazy
+
+        for config in self._camera_configs:
+            cap = cv2.VideoCapture(config.index)
+            if not cap.isOpened():
+                raise RuntimeError(f"Failed to open camera {config.name!r} (index {config.index}).")
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                cap.release()
+                raise RuntimeError(f"Camera {config.name!r} returned no frame on probe read.")
+            self._captures[config.name] = cap
+            self._camera_shapes[config.name] = tuple(int(x) for x in frame.shape)
+
+        logger.info("Opened cameras: %s", self._camera_shapes)
+
+    def _release_cameras(self) -> None:
+        for cap in self._captures.values():
+            try:
+                cap.release()
+            except Exception:
+                pass
+        self._captures.clear()
+        self._camera_shapes.clear()
 
 
 def retargeter_worker(
@@ -337,8 +433,8 @@ def run_local(
     model_path: str | None = None,
     urdf_path: str | None = None,
     port: int = DEFAULT_PORT,
-    handedness: str = "right",
-    confidence: float = 0.7,
+    handedness: str = DEFAULT_HAND,
+    confidence: float = DEFAULT_CONFIDENCE,
     show_video: bool = False,
     sink: RobotSink | None = None,
 ) -> None:
