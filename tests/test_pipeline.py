@@ -93,7 +93,7 @@ def test_ingress_server_receives_frames():
 
     def gen_frames():
         for _ in range(n_frames):
-            kp = np.random.randn(CANONICAL_LANDMARK_SHAPE).astype(np.float32)
+            kp = np.random.randn(*CANONICAL_LANDMARK_SHAPE).astype(np.float32)
             yield hand_stream_pb2.HandFrame(
                 keypoints=kp.ravel().tolist(),
                 handedness="right",
@@ -101,20 +101,22 @@ def test_ingress_server_receives_frames():
             )
             time.sleep(0.01)
 
-    response = stub.StreamHandFrames(gen_frames())
-    assert response.frames_received == n_frames
+    try:
+        response = stub.StreamHandFrames(gen_frames())
+        assert response.frames_received == n_frames
 
-    items = []
-    while not q.empty():
-        items.append(q.get_nowait())
-    assert len(items) > 0
-    for item in items:
-        assert isinstance(item, HandLandmarks)
-        assert item.keypoints.shape == CANONICAL_LANDMARK_SHAPE
-        assert item.handedness == "right"
+        items = []
+        while not q.empty():
+            items.append(q.get_nowait())
+        assert len(items) > 0
+        for item in items:
+            assert isinstance(item, HandLandmarks)
+            assert item.keypoints.shape == CANONICAL_LANDMARK_SHAPE
+            assert item.handedness == "right"
 
-    channel.close()
-    server.stop()
+    finally:
+        channel.close()
+        server.stop()
 
 
 def test_ingress_server_drops_stale_on_full_queue():
