@@ -1,16 +1,11 @@
 """Record teleoperated episodes into a LeRobotDataset.
 
-Wires the standard ingress + retargeter pipeline (without modifying it) and
-runs a parallel recorder thread that writes ``(state, action, images)`` frames
-to a LeRobotDataset on disk. Multi-episode capture, optional camera streams,
-and optional ``--push-to-hub`` are supported.
-
-Pipeline (per episode):
+Record — per episode:
 
   - main thread: pull each ``OrcaJointPositions`` from ``actions_q``, read
-    ``hand.get_joint_position()``, capture one frame from each opened camera,
+    the sink joint state, capture one frame from each configured camera,
     pack everything into a frame dict, push it onto ``rec_q``, then dispatch
-    the action to the hand.
+    the action to the sink.
   - recorder thread: blocks on ``rec_q``, calls ``dataset.add_frame(...)`` for
     every dict, and ``dataset.save_episode()`` when it sees the SAVE sentinel
   - between episodes: a small rest pause; at the end: optional push to Hub
@@ -19,11 +14,15 @@ Example usage:
 
 .. code-block:: bash
 
-    HF_USERNAME=your_username python scripts/record_dataset.py --repo-id $HF_USERNAME/orca-teleop \
-        --task "pick up the block" \\  # text description of the task
-        --num-episodes 5 --episode-seconds 20 \
-        --camera front:0 --camera wrist:1 \\  # camera specs, given as camera_name:camera_index
+    HF_USERNAME=your_username python scripts/record_dataset.py --repo-id $HF_USERNAME/orca-teleop \\
+        --task "pick up the block" \\
+        --num-episodes 5 --episode-seconds 20 \\
+        --camera front:0 --camera wrist:1 \\
         --push-to-hub
+
+    # Record using a simulated hand
+    python scripts/record_dataset.py --backend sim --repo-id $HF_USERNAME/orca-sim \\
+        --task "pick up the block" --num-episodes 5
 """
 
 import argparse
@@ -31,21 +30,32 @@ import logging
 import os
 import queue
 import shutil
+import sys
 import threading
 import time
 from pathlib import Path
 
 import numpy as np
-from orca_core import OrcaHand, OrcaJointPositions
+from orca_core import OrcaJointPositions
 
 from orca_teleop.constants import (
+    DEFAULT_CONFIDENCE,
+    DEFAULT_HAND,
+    DEFAULT_PORT,
     HEARTBEAT_INTERVAL,
     JOIN_TIMEOUT,
-    MOTION_NUM_STEPS,
     QUEUES_MAXSIZE,
 )
-from orca_teleop.ingress.server import DEFAULT_PORT, IngressServer
-from orca_teleop.pipeline import _SHUTDOWN, TeleopQueues, retargeter_worker
+from orca_teleop.ingress.server import IngressServer
+from orca_teleop.pipeline import (
+    _SHUTDOWN,
+    OpenCVCameraConfig,
+    OrcaHandSink,
+    RecordableSink,
+    TeleopQueues,
+    _mediapipe_publisher,
+    retargeter_worker,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,55 +77,15 @@ def _default_lerobot_root(repo_id: str) -> Path:
     return Path.home() / ".cache" / "huggingface" / "lerobot" / repo_id
 
 
-def _open_cameras(specs: list[str]) -> tuple[dict, dict]:
-    """Open every camera in *specs* (``"name[:index]"``) and probe its shape.
-
-    Returns ``(captures, shapes)`` where ``captures`` is ``{name: cv2.VideoCapture}``
-    and ``shapes`` is ``{name: (H, W, C)}``.
-    """
-    if not specs:
-        return {}, {}
-    import cv2  # lazy
-
-    captures: dict = {}
-    shapes: dict = {}
+def _parse_camera_configs(specs: list[str]) -> list[OpenCVCameraConfig]:
+    configs: list[OpenCVCameraConfig] = []
     for spec in specs:
         name, _, idx_str = spec.partition(":")
         if not name:
             raise ValueError(f"Camera spec {spec!r} is missing a name (use NAME[:INDEX]).")
         index = int(idx_str) if idx_str else 0
-        cap = cv2.VideoCapture(index)
-        if not cap.isOpened():
-            raise RuntimeError(f"Failed to open camera {name!r} (index {index}).")
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            cap.release()
-            raise RuntimeError(f"Camera {name!r} returned no frame on probe read.")
-        captures[name] = cap
-        shapes[name] = tuple(int(x) for x in frame.shape)
-    return captures, shapes
-
-
-def _capture_frames(captures: dict) -> dict:
-    if not captures:
-        return {}
-    import cv2  # lazy
-
-    out: dict = {}
-    for name, cap in captures.items():
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            raise RuntimeError(f"Camera {name!r} read failed mid-episode.")
-        out[name] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    return out
-
-
-def _release_cameras(captures: dict) -> None:
-    for cap in captures.values():
-        try:
-            cap.release()
-        except Exception:
-            pass
+        configs.append(OpenCVCameraConfig(name=name, index=index))
+    return configs
 
 
 def _stub_action_publisher(
@@ -170,8 +140,10 @@ def _recorder_loop(dataset, rec_q: "queue.Queue") -> None:
             logger.exception("Failed to add frame")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+def _main_record(argv: list[str]) -> None:
+    parser = argparse.ArgumentParser(
+        description="Record teleoperated episodes into a LeRobotDataset.",
+    )
     parser.add_argument("--repo-id", required=True, help="LeRobotDataset repo id")
     parser.add_argument("--task", required=True, help="Task description for every episode")
     parser.add_argument(
@@ -196,7 +168,7 @@ def main() -> None:
         "--camera",
         action="append",
         default=[],
-        help="Camera spec NAME[:INDEX], repeatable. e.g. --camera front:0 --camera wrist:1",
+        help="Hardware camera spec camera_name:camera_index, repeatable. Only valid for hardware.",
     )
     parser.add_argument(
         "--push-to-hub",
@@ -223,17 +195,37 @@ def main() -> None:
     parser.add_argument("--model-path", default=None, help="OrcaHand model directory")
     parser.add_argument("--urdf-path", default=None, help="Hand URDF file")
     parser.add_argument(
+        "--backend",
+        choices=["hardware", "sim"],
+        default="hardware",
+        help="Backend to record against (default: hardware).",
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=DEFAULT_PORT,
         help=f"gRPC ingress port (default: {DEFAULT_PORT})",
     )
     parser.add_argument(
+        "--local",
+        action="store_true",
+        help="Also launch a local MediaPipe webcam publisher for one-command recording.",
+    )
+    parser.add_argument(
+        "--show-video",
+        action="store_true",
+        help="Show the local MediaPipe webcam feed with landmarks.",
+    )
+    parser.add_argument(
         "--stub",
         action="store_true",
         help="Dev only: skip ingress + retargeter, push random actions, do NOT dispatch to hand.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.backend == "sim" and args.camera:
+        parser.error("--camera is only valid with --backend hardware.")
+    if args.local and args.stub:
+        parser.error("--local cannot be combined with --stub.")
 
     logging.basicConfig(
         level=logging.INFO,
@@ -250,24 +242,25 @@ def main() -> None:
     )
     stop_event = threading.Event()
 
-    hand = OrcaHand(args.model_path)
-    success, message = hand.connect()
-    if not success:
-        raise RuntimeError(f"Robot failed to connect: {message}")
-    hand.init_joints()
+    if args.backend == "sim":
+        from orca_teleop.sim import OrcaHandSimSink
 
-    joint_ids = list(hand.config.joint_ids)
+        sink: RecordableSink = OrcaHandSimSink()
+    else:
+        sink = OrcaHandSink(
+            model_path=args.model_path,
+            camera_configs=_parse_camera_configs(args.camera),
+        )
+    sink.connect()
+
+    joint_ids = list(sink.joint_ids)
     n_joints = len(joint_ids)
-
-    captures, camera_shapes = _open_cameras(args.camera)
-    if captures:
-        logger.info("Opened cameras: %s", camera_shapes)
 
     features = {
         "observation.state": {"dtype": "float32", "shape": (n_joints,), "names": joint_ids},
         "action": {"dtype": "float32", "shape": (n_joints,), "names": joint_ids},
     }
-    for cam_name, shape in camera_shapes.items():
+    for cam_name, shape in sink.camera_shapes.items():
         features[f"observation.images.{cam_name}"] = {
             "dtype": "video",
             "shape": shape,
@@ -293,6 +286,7 @@ def main() -> None:
     ingress_server: IngressServer | None = None
     retargeter_thread: threading.Thread | None = None
     stub_thread: threading.Thread | None = None
+    publisher_process = None
 
     if args.stub:
         logger.info(
@@ -305,6 +299,22 @@ def main() -> None:
         )
         stub_thread.start()
     else:
+        if args.local:
+            import multiprocessing
+
+            ctx = multiprocessing.get_context("spawn")
+            publisher_process = ctx.Process(
+                target=_mediapipe_publisher,
+                args=(args.port, DEFAULT_HAND, DEFAULT_CONFIDENCE, args.show_video),
+                name="mediapipe-publisher",
+                daemon=True,
+            )
+            publisher_process.start()
+            logger.info(
+                "Local MediaPipe publisher started (pid=%d, hand=%s)",
+                publisher_process.pid,
+                "right",
+            )
         ingress_server = IngressServer(queues.landmarks_q, stop_event, port=args.port)
         ingress_server.start()
         retargeter_thread = threading.Thread(
@@ -343,11 +353,11 @@ def main() -> None:
                     break
                 assert isinstance(action, OrcaJointPositions)
 
-                state_arr = hand.get_joint_position().as_array(joint_ids).astype(np.float32)
+                state_arr = sink.get_joint_state()
                 action_arr = action.as_array(joint_ids).astype(np.float32)
 
                 try:
-                    cam_images = _capture_frames(captures)
+                    cam_images = sink.capture_frames()
                 except Exception:
                     logger.exception("Camera capture failed; aborting episode.")
                     stop_event.set()
@@ -368,7 +378,7 @@ def main() -> None:
                     logger.debug("rec_q full; dropping frame")
 
                 if not args.stub:
-                    hand.set_joint_positions(action, num_steps=MOTION_NUM_STEPS)
+                    sink.dispatch_action(action)
 
             logger.info("Episode %d captured %d frames.", ep_idx + 1, n_frames)
             rec_q.put(_SAVE_EPISODE)
@@ -386,14 +396,16 @@ def main() -> None:
 
         if ingress_server is not None:
             ingress_server.stop()
+        if publisher_process is not None and publisher_process.is_alive():
+            publisher_process.terminate()
+        if publisher_process is not None:
+            publisher_process.join(timeout=3.0)
         if retargeter_thread is not None:
             retargeter_thread.join(timeout=JOIN_TIMEOUT)
         if stub_thread is not None:
             stub_thread.join(timeout=JOIN_TIMEOUT)
 
         recorder_thread.join()
-
-        _release_cameras(captures)
 
         try:
             num_eps = dataset.num_episodes
@@ -409,11 +421,11 @@ def main() -> None:
             except Exception:
                 logger.exception("Failed to push to hub")
 
-        try:
-            hand.set_zero_position()
-            hand.disable_torque()
-        finally:
-            hand.disconnect()
+        sink.close()
+
+
+def main() -> None:
+    _main_record(sys.argv[1:])
 
 
 if __name__ == "__main__":
