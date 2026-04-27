@@ -16,7 +16,7 @@ Two ways to run:
     python scripts/retargeter_diagnostics.py
     python -m orca_teleop.ingress.mediapipe.publisher --server localhost:50051
 
-Layout: a single matplotlib window with two 3D panels.
+Layout: a single matplotlib window with two panels.
 
   - Left:  the normalized hand landmarks (21 joints), wrist + bones colored
            per finger so the pose is always visible.
