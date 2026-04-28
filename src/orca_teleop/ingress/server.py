@@ -32,12 +32,21 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
+class WristPose:
+    """6-DoF wrist pose in the world/camera frame."""
+
+    position: np.ndarray  # (3,) float32, meters — xyz in world frame
+    rotation: np.ndarray  # (3, 3) float32 — rotation matrix (wrist → world)
+
+
+@dataclass(frozen=True, slots=True)
 class HandLandmarks:
     """Canonical frame that travels on the landmarks queue."""
 
     keypoints: np.ndarray  # (21, 3) float32, wrist-relative, meters
     handedness: Literal["left", "right"]
     timestamp_ns: int
+    wrist_pose: WristPose | None = None
 
 
 class _HandStreamServicer(hand_stream_pb2_grpc.HandStreamServicer):
@@ -77,10 +86,21 @@ class _HandStreamServicer(hand_stream_pb2_grpc.HandStreamServicer):
                 keypoints = np.array(frame.keypoints, dtype=np.float32).reshape(
                     _NUM_KEYPOINTS, _COORDS_PER_POINT
                 )
+
+                wrist_pose: WristPose | None = None
+                if frame.HasField("wrist_pose"):
+                    wp = frame.wrist_pose
+                    if len(wp.position) == 3 and len(wp.rotation) == 9:
+                        wrist_pose = WristPose(
+                            position=np.array(wp.position, dtype=np.float32),
+                            rotation=np.array(wp.rotation, dtype=np.float32).reshape(3, 3),
+                        )
+
                 landmark = HandLandmarks(
                     keypoints=keypoints,
                     handedness=handedness,
                     timestamp_ns=frame.timestamp_ns,
+                    wrist_pose=wrist_pose,
                 )
 
                 # Always keep the latest frame; drop stale ones.
