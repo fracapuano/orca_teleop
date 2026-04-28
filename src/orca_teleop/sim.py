@@ -15,7 +15,7 @@ import numpy as np
 from orca_core import OrcaJointPositions
 from orca_sim.envs import RENDER_FPS, BaseOrcaHandEnv
 
-from orca_teleop.pipeline import _SHUTDOWN, RecordableSink
+from orca_teleop.pipeline import _SHUTDOWN, RecordableSink, TeleopAction
 from orca_teleop.utils import RateTicker
 
 logger = logging.getLogger(__name__)
@@ -134,7 +134,7 @@ class OrcaHandSimSink(RecordableSink):
 
     def run_loop(
         self,
-        actions_q: queue.Queue[OrcaJointPositions | object],
+        actions_q: queue.Queue[TeleopAction | object],
         stop_event: threading.Event,
     ) -> None:
         assert self._env is not None, "connect() must be called before run_loop()"
@@ -148,12 +148,12 @@ class OrcaHandSimSink(RecordableSink):
                 item = actions_q.get_nowait()
                 if item is _SHUTDOWN:
                     shutdown_received = True
-                elif isinstance(item, OrcaJointPositions):
+                elif isinstance(item, TeleopAction):
                     try:
-                        self._last_action = item
+                        self._last_action = item.joint_positions
                     except Exception:
                         logger.exception(
-                            "SimSink failed to convert OrcaJointPositions; holding last action"
+                            "SimSink failed to convert TeleopAction; holding last action"
                         )
             except queue.Empty:
                 pass

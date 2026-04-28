@@ -18,6 +18,7 @@ from orca_teleop.ingress import hand_stream_pb2, hand_stream_pb2_grpc
 from orca_teleop.ingress.server import HandLandmarks, IngressServer
 from orca_teleop.pipeline import (
     _SHUTDOWN,
+    TeleopAction,
     TeleopQueues,
     retargeter_worker,
     robot_worker,
@@ -55,7 +56,7 @@ def _start(target, *args, name: str | None = None) -> threading.Thread:
 
 def test_public_exports():
     from orca_teleop import (  # noqa: F401
-        TeleopQueues as _PQ,
+        TeleopAction as _TA,
     )
 
 
@@ -211,7 +212,7 @@ def test_robot_consumes_orca_joint_positions(patch_mock_hand):
     q = _make_queues()
     stop = threading.Event()
     ready = threading.Event()
-    action = _midpoint_action()
+    action = TeleopAction(joint_positions=_midpoint_action())
     q.actions_q.put(action)
     q.actions_q.put(action)
     q.actions_q.put(_SHUTDOWN)
@@ -227,7 +228,7 @@ def test_robot_accepts_in_rom_positions(patch_mock_hand):
     q = _make_queues()
     stop = threading.Event()
     ready = threading.Event()
-    q.actions_q.put(_midpoint_action())
+    q.actions_q.put(TeleopAction(joint_positions=_midpoint_action()))
     q.actions_q.put(_SHUTDOWN)
     t = _start(robot_worker, q, stop, ready, None, name="robot")
     assert ready.wait(2.0)
@@ -309,7 +310,7 @@ def test_robot_finally_cleans_up_on_exception(monkeypatch):
     q = _make_queues()
     stop = threading.Event()
     ready = threading.Event()
-    q.actions_q.put(_midpoint_action())
+    q.actions_q.put(TeleopAction(joint_positions=_midpoint_action()))
     t = _start(robot_worker, q, stop, ready, None, name="robot")
     assert ready.wait(2.0)
     t.join(timeout=2.0)
@@ -399,7 +400,8 @@ def test_retargeter_forwards_joint_positions(monkeypatch):
     actions = [x for x in items if x is not _SHUTDOWN]
     assert len(actions) > 0
     for action in actions:
-        assert isinstance(action, OrcaJointPositions)
+        assert isinstance(action, TeleopAction)
+        assert isinstance(action.joint_positions, OrcaJointPositions)
 
 
 def test_retargeter_skips_none_actions(monkeypatch):
