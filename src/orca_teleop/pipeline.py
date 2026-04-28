@@ -51,7 +51,7 @@ from orca_teleop.constants import (
     MOTION_NUM_STEPS,
     QUEUES_MAXSIZE,
 )
-from orca_teleop.ingress.server import HandLandmarks, IngressServer
+from orca_teleop.ingress.server import HandLandmarks, IngressServer, WristPose
 from orca_teleop.retargeting.retargeter import Retargeter, TargetPose
 
 logger = logging.getLogger(__name__)
@@ -67,10 +67,18 @@ def _shutdown_queue(q: "queue.Queue[Any]") -> None:
         pass
 
 
+@dataclass(frozen=True)
+class TeleopAction:
+    """Single output frame from the retargeter: finger joints + optional wrist."""
+
+    joint_positions: OrcaJointPositions
+    wrist_pose: WristPose | None = None
+
+
 @dataclass
 class TeleopQueues:
     landmarks_q: "queue.Queue[HandLandmarks]"
-    actions_q: "queue.Queue[OrcaJointPositions | object]"
+    actions_q: "queue.Queue[TeleopAction | object]"
 
 
 @dataclass(frozen=True)
@@ -177,7 +185,7 @@ class OrcaHandSink(RecordableSink):
 
     def run_loop(
         self,
-        actions_q: "queue.Queue[OrcaJointPositions | object]",
+        actions_q: "queue.Queue[TeleopAction | object]",
         stop_event: threading.Event,
     ) -> None:
         assert self._hand is not None, "connect() must be called before run_loop()"
@@ -188,8 +196,8 @@ class OrcaHandSink(RecordableSink):
                 continue
             if action is _SHUTDOWN:
                 break
-            assert isinstance(action, OrcaJointPositions)
-            self.dispatch_action(action)
+            assert isinstance(action, TeleopAction)
+            self.dispatch_action(action.joint_positions)
 
     def close(self) -> None:
         if self._hand is None:
@@ -283,8 +291,13 @@ def retargeter_worker(
             if action is None:
                 continue
 
+            teleop_action = TeleopAction(
+                joint_positions=action,
+                wrist_pose=item.wrist_pose,
+            )
+
             try:
-                queues.actions_q.put_nowait(action)
+                queues.actions_q.put_nowait(teleop_action)
             except queue.Full:
                 pass
 
@@ -329,8 +342,8 @@ def robot_worker(
                 continue
             if action is _SHUTDOWN:
                 break
-            assert isinstance(action, OrcaJointPositions)
-            hand.set_joint_positions(action, num_steps=MOTION_NUM_STEPS)
+            assert isinstance(action, TeleopAction)
+            hand.set_joint_positions(action.joint_positions, num_steps=MOTION_NUM_STEPS)
     except Exception as e:
         logger.exception("Robot worker error: %s", e)
     finally:
