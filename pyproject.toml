@@ -14,10 +14,11 @@ dependencies = [
     "pytorch-kinematics",
     "grpcio>=1.62.3",
     "protobuf>=4.25.9,<5",
-    "orca_core @ git+https://github.com/orcahand/orca_core.git@main",
+    "orca_core @ file:///Users/fracapuano/Documents/orca_core",
 ]
 
 [project.optional-dependencies]
+# Fix local paths to packages before merging
 test = [
     "pytest>=8.0",
 ]
@@ -35,7 +36,14 @@ manus = [
     # Add manus pro-related dependencies here
 ]
 sim = [
-    "orca_sim @ git+https://github.com/orcahand/orca_sim.git@main"
+    "orca_sim @ file:///Users/fracapuano/Documents/orca_sim"
+]
+
+orca_arm = [
+    "orca_arm",
+    "orca_sim @ file:///Users/fracapuano/Documents/orca_sim",
+    "orca_core @ file:///Users/fracapuano/Documents/orca_core",
+    "placo"
 ]
 
 [build-system]
