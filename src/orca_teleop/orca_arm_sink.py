@@ -60,12 +60,28 @@ class BimanualIKSolver:
         pos_tol: float = 1e-3,
         ori_tol: float = 0.01,
         solver: str = "quadprog",
+        orientation_cost: float = 0.0,
+        posture_cost: float = 0.0,
     ) -> None:
+        # NOTE on orientation_cost: the OrcaArm has 5 DOF per side, but a 6D
+        # SE(3) wrist pose has 6 dimensions of freedom. Asking the IK to track
+        # full 6D pose with any orientation_cost > 0 forces the QP to trade
+        # position for orientation along the unreachable direction, costing
+        # tens of mm of position error even for in-reach targets. Pass a
+        # 3-vector (e.g. [1, 1, 0]) to leave one body-frame axis free for a
+        # 5-DOF tracking formulation that the arm CAN satisfy exactly.
+        # NOTE on posture_cost: a small positive value (e.g. 1e-3) regularizes
+        # the IK against branch flips at near-singular configs. The posture
+        # target is re-anchored to ``q0`` on every ``solve`` call, so the task
+        # penalizes frame-to-frame *change* without biasing toward any
+        # specific posture (no "pulled toward home" feel).
         self._max_iters = max_iters
         self._dt = dt
         self._pos_tol = pos_tol
         self._ori_tol = ori_tol
         self._solver = solver
+        self._orientation_cost = orientation_cost
+        self._posture_cost = posture_cost
 
         self._model = pin.buildModelFromUrdf(orca_arm.URDF_PATH)
         self._data = self._model.createData()
@@ -98,12 +114,16 @@ class BimanualIKSolver:
             self._tasks[side] = pink.FrameTask(
                 self._carpals_names[side],
                 position_cost=1.0,
-                orientation_cost=1.0,
+                orientation_cost=self._orientation_cost,
             )
             joint_names = [f"openarm_{side}_joint{i}" for i in range(1, _ARM_JOINTS_PER_SIDE + 1)]
             self._arm_idx_q[side] = [
                 self._model.joints[self._model.getJointId(j)].idx_q for j in joint_names
             ]
+
+        self._posture_task: pink.PostureTask | None = (
+            pink.PostureTask(cost=self._posture_cost) if self._posture_cost > 0.0 else None
+        )
 
     @property
     def neutral_q(self) -> np.ndarray:
@@ -153,6 +173,9 @@ class BimanualIKSolver:
         for side, target_pose in targets.items():
             self._tasks[side].set_target(target_pose)
             active_tasks.append(self._tasks[side])
+        if self._posture_task is not None:
+            self._posture_task.set_target(q0.copy())
+            active_tasks.append(self._posture_task)
 
         for _ in range(self._max_iters):
             vel = pink.solve_ik(
