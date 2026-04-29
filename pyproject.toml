@@ -30,7 +30,7 @@ avp = [
     "avp-stream>=1.0,<2.0",
 ]
 metaquest = [
-    # Add metaquest-related dependencies here
+    "hand-tracking-sdk>=1.1.0",
 ]
 manus = [
     # Add manus pro-related dependencies here
@@ -43,7 +43,10 @@ orca_arm = [
     "orca_arm",
     "orca_sim @ file:///Users/fracapuano/Documents/orca_sim",
     "orca_core @ file:///Users/fracapuano/Documents/orca_core",
-    "placo"
+    "placo",
+    "pin",
+    "pin-pink",
+    "orca_teleop[metaquest]"
 ]
 
 [build-system]
