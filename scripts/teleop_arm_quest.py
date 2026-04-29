@@ -246,11 +246,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--free-roll-axis",
-        default="Z",
+        default="Y",
         choices=["X", "Y", "Z"],
         help="body-frame axis whose rotation is unconstrained when orientation-cost > 0."
-        " Z = free wrist roll about the carpals frame's local +Z (matches user intuition);"
-        " Y empirically gives slightly better tracking on the OrcaArm URDF",
+        " Default Y: empirically best on the OrcaArm URDF (1/900 stuck frames vs"
+        " 15/900 for Z). Z is more intuitive (free wrist roll about local +Z) but"
+        " gives a less usable null space on this kinematic chain.",
     )
     parser.add_argument(
         "--posture-cost",
@@ -322,6 +323,10 @@ def main() -> None:
 
     logger.info("Ready. Waiting for publisher on :%d. Ctrl+C to stop.", args.port)
 
+    free_pos_idx = (
+        None if args.free_position_axis == "none" else ord(args.free_position_axis) - ord("X")
+    )
+
     period = 1.0 / args.ik_rate
     next_tick = time.monotonic()
     last_log = time.monotonic()
@@ -344,6 +349,16 @@ def main() -> None:
             )
 
             if targets:
+                if free_pos_idx is not None:
+                    # Spoof the target's free-axis component with the current FK
+                    # so the IK has zero error along that axis and won't try to
+                    # move it. World-frame, since FK and target both live in world.
+                    for side in targets:
+                        cur_p = ik.forward_kinematics(q_prev, side)
+                        T_t = targets[side]
+                        new_p = T_t.translation.copy()
+                        new_p[free_pos_idx] = cur_p[free_pos_idx]
+                        targets[side] = pin.SE3(T_t.rotation, new_p)
                 result = ik.solve(targets, q_prev)
                 # No more snap-back to q_home: the posture-regularization task
                 # already keeps q from drifting into bad branches, so carrying
