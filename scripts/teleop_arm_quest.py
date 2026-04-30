@@ -19,6 +19,7 @@ Or, all-in-one:
 """
 
 import argparse
+import collections
 import logging
 import multiprocessing
 import queue
@@ -30,7 +31,21 @@ import numpy as np
 import pinocchio as pin
 from hand_tracking_sdk.convert import BASIS_UNITY_LEFT_TO_FLU
 
-from orca_teleop.constants import DEFAULT_PORT, QUEUES_MAXSIZE
+from orca_teleop.constants import (
+    AUTO_FIT_MARGIN,
+    BOOTSTRAP_SCALE,
+    CLUTCH_GRACE_S,
+    DEFAULT_PORT,
+    INGRESS_FPS,
+    MIN_SPAN_SAMPLES,
+    QUEUES_MAXSIZE,
+    SPAN_BUFFER_SECONDS,
+    SPAN_CHANGE_THRESHOLD,
+    SPAN_REFIT_PERIOD_S,
+    STILL_THRESHOLD_M,
+    STILL_WINDOW_SAMPLES,
+    WORKSPACE_HALF_BOX_M,
+)
 from orca_teleop.ingress.server import HandLandmarks, IngressServer
 from orca_teleop.orca_arm_sink import BimanualIKSolver, OrcaArmMeshcatSink
 
@@ -38,15 +53,6 @@ logger = logging.getLogger(__name__)
 
 SIDES = ("left", "right")
 IK_RATE_HZ = 60
-CALIB_SAMPLES = 30  # ~1 second at 30 Hz publisher rate; "hold still"
-# Operator motion sweeps ~60 cm; the OrcaArm 5-DOF reachable workspace is much
-# smaller in 3D (axis bboxes look ~0.9 m but the reachable solid is much
-# tighter). Defaults below were validated on the recorded dataset; tracking
-# stays clean (median IK residual ~0 mm, p90 < 15 mm).
-DEFAULT_WORKSPACE_HALF_BOX_M = 0.10
-DEFAULT_AUTO_FIT_SAMPLES = 150  # 5 s at 30 Hz — observe operator natural span
-DEFAULT_AUTO_FIT_MARGIN = 0.7  # use this fraction of the workspace as fit target
-BOOTSTRAP_SCALE = 0.15  # scale used during span observation phase
 
 # Unity LH → robot FLU. SDK's basis_transform_rotation_matrix takes a quaternion
 # (misleading name), so we apply the basis change directly: p' = B p, R' = B R B.T.
@@ -74,31 +80,49 @@ def _mean_rotation(rotations: list[np.ndarray]) -> np.ndarray:
 
 def _drain_queue(
     landmarks_q: "queue.Queue",
-    calib_buf: dict[str, list[pin.SE3]],
-    span_buf: dict[str, list[np.ndarray]],
+    pose_window: dict[str, "collections.deque"],
+    span_buf: dict[str, "collections.deque"],
+    last_refit_t: dict[str, float],
+    clutch_start_t: dict[str, float | None],
     T_first: dict[str, pin.SE3],
     T_home: dict[str, pin.SE3],
     scale: dict[str, float],
     targets: dict[str, pin.SE3],
+    ik: BimanualIKSolver,
+    q_prev: np.ndarray,
+    *,
     manual_scale: float | None,
     workspace_half_box_m: float,
     auto_fit_margin: float,
-    span_samples: int,
+    min_span_samples: int,
+    span_refit_period_s: float,
+    span_change_threshold: float,
+    still_threshold_m: float,
+    still_window_samples: int,
+    clutch_grace_s: float,
 ) -> None:
-    """Pull everything the ingress has buffered.
+    """Per-side state machine: ``awaiting_anchor`` → ``tracking`` ⇄ ``clutched``.
 
-    Three-phase per-side state machine:
-      1. anchor (CALIB_SAMPLES of "hold still") -> T_first[side]
-      2. span observation (span_samples of natural motion) -> auto-fit scale[side]
-      3. teleop with locked scale
+    Stillness is the engagement gesture. While ``awaiting_anchor``, the side
+    waits for ``still_window_samples`` of low-motion data, then anchors at the
+    window mean and goes straight into ``tracking`` (no grace).
 
-    During phase 2 we run with BOOTSTRAP_SCALE so the operator gets feedback
-    while extending to demonstrate range. If --translation-scale was passed
-    explicitly, phase 2 is skipped and that value is used directly.
+    During ``tracking``, detected stillness enters ``clutched``. While clutched
+    the robot is frozen and operator motion is ignored. On the first motion
+    sample after ``clutch_grace_s`` of clutch time has elapsed, the side
+    exits clutch by re-anchoring ``T_first[side]`` to the operator's CURRENT
+    pose and ``T_home[side]`` to ``FK(q_prev, side)`` — so dp = 0 at the
+    handoff and tracking resumes from wherever the operator just repositioned.
 
-    Mapping after calibration:
-        p_target = T_home.translation + s * (p_op - p_first)   (then clamped)
-        R_target = (R_op @ R_first.T) @ T_home.rotation
+    Span observation is a rolling background process: every visible sample is
+    appended to ``span_buf[side]``. Every ``span_refit_period_s``, if the
+    buffer holds at least ``min_span_samples`` points, fit a fresh translation
+    scale and swap it in only if it would change by more than
+    ``span_change_threshold`` (relative).
+
+    Mutates ``T_first``, ``T_home``, ``scale``, ``targets``,
+    ``clutch_start_t``, ``last_refit_t``, ``pose_window``, ``span_buf``
+    in place.
     """
     while True:
         try:
@@ -112,73 +136,100 @@ def _drain_queue(
             continue
         T_op = _wrist_pose_to_robot_se3(item.wrist_pose.position, item.wrist_pose.rotation)
 
-        # Phase 1: anchor
+        pose_window[side].append(T_op)
+
+        # Stillness check needs a full window. While the deque is filling, we
+        # treat the side as not-still — the awaiting-anchor branch will simply
+        # keep waiting; the engaged branch (if reached) tracks normally.
+        full_window = len(pose_window[side]) >= still_window_samples
+        if full_window:
+            pts = np.array([T.translation for T in pose_window[side]])
+            still = float(np.max(pts.max(axis=0) - pts.min(axis=0))) < still_threshold_m
+        else:
+            still = False
+
+        # Phase: awaiting_anchor — sit until the operator holds still. Initial
+        # anchor goes straight into tracking (clutch_start_t stays None).
         if side not in T_first:
-            calib_buf[side].append(T_op)
-            if len(calib_buf[side]) < CALIB_SAMPLES:
-                continue
-            mean_p = np.mean([T.translation for T in calib_buf[side]], axis=0)
-            R_anchor = _mean_rotation([T.rotation for T in calib_buf[side]])
-            T_first[side] = pin.SE3(R_anchor, mean_p)
-            calib_buf[side].clear()
-            if manual_scale is not None:
-                scale[side] = manual_scale
+            if still:
+                p_first = pts.mean(axis=0)
+                R_first = _mean_rotation([T.rotation for T in pose_window[side]])
+                T_first[side] = pin.SE3(R_first, p_first)
+                clutch_start_t[side] = None
+                # Seed an initial target at the side's home pose so the IK has
+                # something to track immediately (delta = 0 → no motion).
+                targets[side] = pin.SE3(T_home[side].rotation, T_home[side].translation.copy())
+                if manual_scale is not None:
+                    scale[side] = manual_scale
                 logger.info(
-                    "Anchored %s (n=%d, op centroid=%s); using manual scale=%.3f",
+                    "Anchored %s on stillness (op centroid=%s)",
                     side,
-                    CALIB_SAMPLES,
-                    np.round(mean_p, 3).tolist(),
-                    manual_scale,
-                )
-            else:
-                logger.info(
-                    "Anchored %s (n=%d, op centroid=%s); now observing %d span"
-                    " samples for auto-fit (move freely)",
-                    side,
-                    CALIB_SAMPLES,
-                    np.round(mean_p, 3).tolist(),
-                    span_samples,
+                    np.round(p_first, 3).tolist(),
                 )
             continue
 
-        # Phase 2: observe span (only if auto-fit and not yet locked)
+        # Phase: engaged.  Maintain the rolling span buffer regardless of
+        # stillness — old samples drop off the deque tail, so prolonged
+        # stillness doesn't stall the buffer.
+        span_buf[side].append(T_op.translation.copy())
         if side not in scale:
-            span_buf[side].append(T_op.translation.copy())
-            if len(span_buf[side]) >= span_samples:
-                pts = np.array(span_buf[side])
-                max_half = float(((pts.max(axis=0) - pts.min(axis=0)) / 2.0).max())
-                if max_half > 1e-3:
-                    fitted = (auto_fit_margin * workspace_half_box_m) / max_half
-                else:
-                    fitted = BOOTSTRAP_SCALE
-                scale[side] = float(np.clip(fitted, 0.05, 1.0))
-                span_buf[side].clear()
-                logger.info(
-                    "Auto-fit %s: op_max_half=%.3fm  ws_half=%.3fm" "  margin=%.2f  →  scale=%.3f",
-                    side,
-                    max_half,
-                    workspace_half_box_m,
-                    auto_fit_margin,
-                    scale[side],
-                )
-            s = BOOTSTRAP_SCALE if side not in scale else scale[side]
-        else:
-            s = scale[side]
+            scale[side] = BOOTSTRAP_SCALE
 
-        # Phase 3: teleop mapping
+        now = time.monotonic()
+        if (
+            manual_scale is None
+            and len(span_buf[side]) >= min_span_samples
+            and now - last_refit_t.get(side, 0.0) >= span_refit_period_s
+        ):
+            buf_pts = np.array(span_buf[side])
+            max_half = float(((buf_pts.max(axis=0) - buf_pts.min(axis=0)) / 2.0).max())
+            fitted = (auto_fit_margin * workspace_half_box_m) / max(max_half, 1e-3)
+            fitted = float(np.clip(fitted, 0.05, 1.0))
+            old = scale[side]
+            if abs(fitted - old) / max(old, 1e-6) > span_change_threshold:
+                scale[side] = fitted
+                logger.info(
+                    "Span re-fit %s: %.3f → %.3f (op_max_half=%.3fm, n=%d)",
+                    side,
+                    old,
+                    fitted,
+                    max_half,
+                    len(span_buf[side]),
+                )
+            last_refit_t[side] = now
+
+        # Stillness during engaged: enter clutch (or stay clutched). Robot
+        # frozen; operator's current motion is irrelevant during clutch.
+        if still:
+            if clutch_start_t[side] is None:
+                clutch_start_t[side] = now
+                logger.info("Clutched %s (still detected)", side)
+            continue
+
+        # Moving: are we currently clutched?
+        if clutch_start_t[side] is not None:
+            elapsed = now - clutch_start_t[side]
+            if elapsed < clutch_grace_s:
+                # In grace: ignore motion, robot stays frozen.
+                continue
+            # Grace expired and operator is moving: exit clutch with a no-snap
+            # re-anchor at the operator's CURRENT pose. dp = 0 this frame, so
+            # the robot doesn't jump; the new anchor becomes the new origin
+            # for subsequent deltas.
+            T_first[side] = pin.SE3(T_op.rotation.copy(), T_op.translation.copy())
+            T_home[side] = pin.SE3(ik.forward_kinematics_full(q_prev, side))
+            clutch_start_t[side] = None
+            logger.info("Re-anchored %s on motion resume after %.1fs clutch", side, elapsed)
+
+        # Normal teleop mapping
+        s = scale[side]
         dR = T_op.rotation @ T_first[side].rotation.T
         dp = s * (T_op.translation - T_first[side].translation)
         if workspace_half_box_m > 0.0:
             dp = np.clip(dp, -workspace_half_box_m, workspace_half_box_m)
-        R_target = dR @ T_home[side].rotation
-        p_target = T_home[side].translation + dp
-        targets[side] = pin.SE3(R_target, p_target)
-        logger.debug(
-            "%s: |dp|=%.3f m  dp=%s  target_p=%s",
-            side,
-            float(np.linalg.norm(dp)),
-            np.round(dp, 3).tolist(),
-            np.round(p_target, 3).tolist(),
+        targets[side] = pin.SE3(
+            dR @ T_home[side].rotation,
+            T_home[side].translation + dp,
         )
 
 
@@ -215,26 +266,8 @@ def main() -> None:
         "--translation-scale",
         type=float,
         default=None,
-        help="manual translation scale; if unset, auto-fit from operator's"
-        " observed span over the first ~5 s of post-anchor motion",
-    )
-    parser.add_argument(
-        "--workspace-half-box",
-        type=float,
-        default=DEFAULT_WORKSPACE_HALF_BOX_M,
-        help="per-axis clamp on the (scaled) translation delta in m; 0 disables",
-    )
-    parser.add_argument(
-        "--auto-fit-margin",
-        type=float,
-        default=DEFAULT_AUTO_FIT_MARGIN,
-        help="auto-fit safety factor; scale = margin * workspace_half_box / op_max_half",
-    )
-    parser.add_argument(
-        "--span-samples",
-        type=int,
-        default=DEFAULT_AUTO_FIT_SAMPLES,
-        help="post-anchor samples to observe operator's natural motion span",
+        help="manual translation scale; if unset, auto-fit from the operator's"
+        " observed span (constants in orca_teleop.constants)",
     )
     parser.add_argument(
         "--orientation-cost",
@@ -275,13 +308,24 @@ def main() -> None:
     if args.orientation_cost > 0.0:
         # Free roll about the chosen body-frame axis: zero out that axis's cost,
         # keep the other two at args.orientation_cost. This gives a 5-DOF target
-        # (3 position + 2 orientation) that the 5-DOF arm can track exactly.
-        ori_cost: object = np.full(3, args.orientation_cost, dtype=np.float64)
-        ori_cost[ord(args.free_roll_axis) - ord("X")] = 0.0
+        # (3 position + 2 orientation) that 5-DOF arm can track exactly.
+        orientation_cost: object = np.full(3, args.orientation_cost, dtype=np.float64)
+        orientation_cost[ord(args.free_roll_axis) - ord("X")] = 0.0
     else:
-        ori_cost = 0.0
-    ik = BimanualIKSolver(orientation_cost=ori_cost, posture_cost=args.posture_cost)
+        orientation_cost = 0.0
+    ik = BimanualIKSolver(orientation_cost=orientation_cost, posture_cost=args.posture_cost)
     sink = OrcaArmMeshcatSink()
+
+    # Sanity: the IK uses pinocchio's q ordering, the sink uses yourdfpy's
+    # actuated-joint ordering. They both look up by name, but assert the two
+    # mappings actually agree before we stream q values between them.
+    expected_names = {side: [f"openarm_{side}_joint{i}" for i in range(1, 6)] for side in SIDES}
+    assert ik.arm_joint_names == sink.arm_joint_names == expected_names, (
+        f"Arm joint index mapping mismatch:\n"
+        f"  ik:       {ik.arm_joint_names}\n"
+        f"  sink:     {sink.arm_joint_names}\n"
+        f"  expected: {expected_names}"
+    )
 
     # Anchor pose: lift both arms into a non-singular "shoulder-height in
     # front" config. joint2 is negated on the right side so the carpals land
@@ -294,11 +338,20 @@ def main() -> None:
         idx_q = ik._arm_idx_q[side]
         for k, v in bias.items():
             q_home[idx_q[k]] = v
-    T_home = {side: pin.SE3(ik.forward_kinematics_full(q_home, side)) for side in SIDES}
+    T_home: dict[str, pin.SE3] = {
+        side: pin.SE3(ik.forward_kinematics_full(q_home, side)) for side in SIDES
+    }
 
+    span_buffer_maxlen = max(int(SPAN_BUFFER_SECONDS * INGRESS_FPS), MIN_SPAN_SAMPLES)
+    pose_window: dict[str, collections.deque] = {
+        side: collections.deque(maxlen=STILL_WINDOW_SAMPLES) for side in SIDES
+    }
+    span_buf: dict[str, collections.deque] = {
+        side: collections.deque(maxlen=span_buffer_maxlen) for side in SIDES
+    }
+    last_refit_t: dict[str, float] = {side: 0.0 for side in SIDES}
+    clutch_start_t: dict[str, float | None] = {side: None for side in SIDES}
     T_first: dict[str, pin.SE3] = {}
-    calib_buf: dict[str, list[pin.SE3]] = {side: [] for side in SIDES}
-    span_buf: dict[str, list[np.ndarray]] = {side: [] for side in SIDES}
     scale: dict[str, float] = {}
     targets: dict[str, pin.SE3] = {}
     q_prev = q_home.copy()
@@ -323,10 +376,6 @@ def main() -> None:
 
     logger.info("Ready. Waiting for publisher on :%d. Ctrl+C to stop.", args.port)
 
-    free_pos_idx = (
-        None if args.free_position_axis == "none" else ord(args.free_position_axis) - ord("X")
-    )
-
     period = 1.0 / args.ik_rate
     next_tick = time.monotonic()
     last_log = time.monotonic()
@@ -336,29 +385,28 @@ def main() -> None:
         while True:
             _drain_queue(
                 landmarks_q,
-                calib_buf,
+                pose_window,
                 span_buf,
+                last_refit_t,
+                clutch_start_t,
                 T_first,
                 T_home,
                 scale,
                 targets,
-                args.translation_scale,
-                args.workspace_half_box,
-                args.auto_fit_margin,
-                args.span_samples,
+                ik,
+                q_prev,
+                manual_scale=args.translation_scale,
+                workspace_half_box_m=WORKSPACE_HALF_BOX_M,
+                auto_fit_margin=AUTO_FIT_MARGIN,
+                min_span_samples=MIN_SPAN_SAMPLES,
+                span_refit_period_s=SPAN_REFIT_PERIOD_S,
+                span_change_threshold=SPAN_CHANGE_THRESHOLD,
+                still_threshold_m=STILL_THRESHOLD_M,
+                still_window_samples=STILL_WINDOW_SAMPLES,
+                clutch_grace_s=CLUTCH_GRACE_S,
             )
 
             if targets:
-                if free_pos_idx is not None:
-                    # Spoof the target's free-axis component with the current FK
-                    # so the IK has zero error along that axis and won't try to
-                    # move it. World-frame, since FK and target both live in world.
-                    for side in targets:
-                        cur_p = ik.forward_kinematics(q_prev, side)
-                        T_t = targets[side]
-                        new_p = T_t.translation.copy()
-                        new_p[free_pos_idx] = cur_p[free_pos_idx]
-                        targets[side] = pin.SE3(T_t.rotation, new_p)
                 result = ik.solve(targets, q_prev)
                 # No more snap-back to q_home: the posture-regularization task
                 # already keeps q from drifting into bad branches, so carrying
