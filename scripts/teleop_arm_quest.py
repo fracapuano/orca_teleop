@@ -9,13 +9,19 @@ In one terminal:
 
     python scripts/teleop_arm_quest.py
 
-In another (replays the HF dataset):
+In another (live Quest stream over HTS):
 
     python -m orca_teleop.ingress.metaquest.publisher
 
-Or, all-in-one:
+Or, all-in-one (spawns the live publisher as a child process so you don't
+need a second terminal; the publisher still connects over localhost gRPC):
 
     python scripts/teleop_arm_quest.py --local
+
+For Quest-less testing, ``--local --dummy`` spawns the dataset-replay
+publisher as the child process instead::
+
+    python scripts/teleop_arm_quest.py --local --dummy
 """
 
 import argparse
@@ -233,9 +239,27 @@ def _drain_queue(
         )
 
 
-def _metaquest_publisher(port: int) -> None:
-    """Child-process entry point for the local replay publisher."""
-    from orca_teleop.ingress.metaquest.publisher import MetaQuestPublisher
+def _metaquest_publisher(
+    port: int,
+    *,
+    dummy: bool,
+    transport: str,
+    quest_host: str,
+    quest_port: int,
+) -> None:
+    """Child-process entry: wait for the local ingress, then run the publisher.
+
+    Mirrors ``pipeline._mediapipe_publisher``: the publisher always speaks
+    gRPC to ``localhost:port``, regardless of whether the data source is a
+    real Quest (``MetaQuestPublisher``) or the recorded dataset
+    (``DummyMetaQuestPublisher``).
+    """
+    from hand_tracking_sdk import TransportMode
+
+    from orca_teleop.ingress.metaquest.publisher import (
+        DummyMetaQuestPublisher,
+        MetaQuestPublisher,
+    )
 
     server_address = f"localhost:{port}"
     deadline = time.monotonic() + 10.0
@@ -250,7 +274,15 @@ def _metaquest_publisher(port: int) -> None:
                 ) from err
             time.sleep(0.1)
 
-    MetaQuestPublisher(server_address=server_address).run()
+    if dummy:
+        DummyMetaQuestPublisher(server_address=server_address).run()
+    else:
+        MetaQuestPublisher(
+            server_address=server_address,
+            transport_mode=TransportMode(transport),
+            quest_host=quest_host,
+            quest_port=quest_port,
+        ).run()
 
 
 def main() -> None:
@@ -260,7 +292,33 @@ def main() -> None:
     parser.add_argument(
         "--local",
         action="store_true",
-        help="also spawn the MetaQuest replay publisher as a child process",
+        help="spawn the publisher as a child process so a single command"
+        " runs both ends. The publisher still connects to the local gRPC"
+        " ingress on --port. Default child = live MetaQuestPublisher; with"
+        " --dummy = DummyMetaQuestPublisher (HF dataset replay).",
+    )
+    parser.add_argument(
+        "--dummy",
+        action="store_true",
+        help="with --local, replay the HF dataset over gRPC instead of"
+        " streaming live from a real Quest",
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["udp", "tcp_server", "tcp_client"],
+        default="udp",
+        help="HTS transport mode (live --local only)",
+    )
+    parser.add_argument(
+        "--quest-host",
+        default="0.0.0.0",
+        help="HTS bind/connect host (live --local only)",
+    )
+    parser.add_argument(
+        "--quest-port",
+        type=int,
+        default=8765,
+        help="HTS bind/connect port (live --local only)",
     )
     parser.add_argument(
         "--translation-scale",
@@ -368,11 +426,22 @@ def main() -> None:
         publisher_process = multiprocessing.Process(
             target=_metaquest_publisher,
             args=(args.port,),
+            kwargs={
+                "dummy": args.dummy,
+                "transport": args.transport,
+                "quest_host": args.quest_host,
+                "quest_port": args.quest_port,
+            },
             name="metaquest-publisher",
             daemon=True,
         )
         publisher_process.start()
-        logger.info("Local publisher started (pid=%d)", publisher_process.pid)
+        kind = (
+            "dummy (HF dataset replay)"
+            if args.dummy
+            else f"live HTS ({args.transport} {args.quest_host}:{args.quest_port})"
+        )
+        logger.info("Local publisher started (pid=%d, %s)", publisher_process.pid, kind)
 
     logger.info("Ready. Waiting for publisher on :%d. Ctrl+C to stop.", args.port)
 
