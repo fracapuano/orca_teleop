@@ -129,6 +129,22 @@ class BimanualIKSolver:
     def neutral_q(self) -> np.ndarray:
         return pin.neutral(self._model).copy()
 
+    @property
+    def arm_joint_names(self) -> dict[str, list[str]]:
+        """Joint names at each entry of ``self._arm_idx_q[side]``, reverse-
+        looked-up from the pinocchio model. Used to validate that this class
+        and its consumers (e.g. the sink) agree on per-side joint orderings."""
+        out: dict[str, list[str]] = {}
+        for side, indices in self._arm_idx_q.items():
+            names = []
+            for idx_q in indices:
+                jid = next(
+                    j for j in range(self._model.njoints) if self._model.joints[j].idx_q == idx_q
+                )
+                names.append(self._model.names[jid])
+            out[side] = names
+        return out
+
     def forward_kinematics(self, q: np.ndarray, side: str) -> np.ndarray:
         """Return the 3-D world position of the wrist for config *q*."""
         return self.forward_kinematics_full(q, side)[:3, 3]
@@ -280,6 +296,14 @@ class OrcaArmMeshcatSink:
 
         self._vis: meshcat.Visualizer | None = None
         self._geom_map: dict[str, str] = {}
+
+    @property
+    def arm_joint_names(self) -> dict[str, list[str]]:
+        """Joint names at each entry of ``self._arm_cfg_indices[side]``."""
+        return {
+            side: [self._actuated_names[idx] for idx in indices]
+            for side, indices in self._arm_cfg_indices.items()
+        }
 
     def launch(self) -> None:
         self._vis = meshcat.Visualizer()
