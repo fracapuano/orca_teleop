@@ -6,23 +6,28 @@ import inspect
 import queue
 import threading
 import time
+from types import SimpleNamespace
 
 import grpc
 import numpy as np
 import pytest
 from conftest import CANONICAL_LANDMARK_SHAPE, plausible_hand_keypoints
 from orca_core import OrcaJointPositions
-from orca_core.test_mock import MockOrcaHand
+from orca_core.hardware_hand import MockOrcaHand
 
 from orca_teleop.ingress import hand_stream_pb2, hand_stream_pb2_grpc
 from orca_teleop.ingress.server import HandLandmarks, IngressServer
 from orca_teleop.pipeline import (
     _SHUTDOWN,
+    TeleopAction,
     TeleopQueues,
+    _resolve_model_config_for_hand,
     retargeter_worker,
     robot_worker,
     run,
 )
+
+ROBOT_READY_TIMEOUT_S = 15.0
 
 
 def _make_queues(maxsize: int = 8) -> TeleopQueues:
@@ -55,7 +60,7 @@ def _start(target, *args, name: str | None = None) -> threading.Thread:
 
 def test_public_exports():
     from orca_teleop import (  # noqa: F401
-        TeleopQueues as _PQ,
+        TeleopAction as _TA,
     )
 
 
@@ -68,6 +73,40 @@ def test_pipeline_queues_dataclass():
 def test_run_signature_stable():
     sig = inspect.signature(run)
     assert "model_path" in sig.parameters
+
+
+def test_resolve_model_config_uses_default_for_requested_hand(monkeypatch):
+    calls = []
+
+    def default_config(handedness):
+        calls.append(handedness)
+        return f"/models/orcahand_{handedness}/config.yaml"
+
+    monkeypatch.setattr("orca_teleop.pipeline._default_model_config_for_hand", default_config)
+
+    assert _resolve_model_config_for_hand(None, "left") == "/models/orcahand_left/config.yaml"
+    assert calls == ["left"]
+
+
+def test_resolve_model_config_accepts_matching_explicit_config(monkeypatch):
+    class _TypedHand:
+        def __init__(self, _model_path):
+            self.config = SimpleNamespace(type="right")
+
+    monkeypatch.setattr("orca_teleop.pipeline.OrcaHand", _TypedHand)
+
+    assert _resolve_model_config_for_hand("/custom/config.yaml", "right") == "/custom/config.yaml"
+
+
+def test_resolve_model_config_rejects_mismatched_explicit_config(monkeypatch):
+    class _TypedHand:
+        def __init__(self, _model_path):
+            self.config = SimpleNamespace(type="right")
+
+    monkeypatch.setattr("orca_teleop.pipeline.OrcaHand", _TypedHand)
+
+    with pytest.raises(ValueError, match="does not match handedness 'left'"):
+        _resolve_model_config_for_hand("/custom/config.yaml", "left")
 
 
 def test_ingress_server_start_stop():
@@ -189,7 +228,7 @@ def test_robot_exits_on_shutdown_sentinel(patch_mock_hand):
     ready = threading.Event()
     q.actions_q.put(_SHUTDOWN)
     t = _start(robot_worker, q, stop, ready, None, name="robot")
-    assert ready.wait(2.0)
+    assert ready.wait(ROBOT_READY_TIMEOUT_S)
     t.join(timeout=2.0)
     assert not t.is_alive()
     assert len(patch_mock_hand) == 1  # the hand was constructed
@@ -200,7 +239,7 @@ def test_robot_sets_ready_after_init(patch_mock_hand):
     stop = threading.Event()
     ready = threading.Event()
     t = _start(robot_worker, q, stop, ready, None, name="robot")
-    assert ready.wait(2.0)
+    assert ready.wait(ROBOT_READY_TIMEOUT_S)
     hand = patch_mock_hand[0]
     assert hand.is_connected()
     stop.set()
@@ -211,12 +250,12 @@ def test_robot_consumes_orca_joint_positions(patch_mock_hand):
     q = _make_queues()
     stop = threading.Event()
     ready = threading.Event()
-    action = _midpoint_action()
+    action = TeleopAction(joint_positions=_midpoint_action())
     q.actions_q.put(action)
     q.actions_q.put(action)
     q.actions_q.put(_SHUTDOWN)
     t = _start(robot_worker, q, stop, ready, None, name="robot")
-    assert ready.wait(2.0)
+    assert ready.wait(ROBOT_READY_TIMEOUT_S)
     t.join(timeout=2.0)
     assert not t.is_alive()
 
@@ -227,10 +266,10 @@ def test_robot_accepts_in_rom_positions(patch_mock_hand):
     q = _make_queues()
     stop = threading.Event()
     ready = threading.Event()
-    q.actions_q.put(_midpoint_action())
+    q.actions_q.put(TeleopAction(joint_positions=_midpoint_action()))
     q.actions_q.put(_SHUTDOWN)
     t = _start(robot_worker, q, stop, ready, None, name="robot")
-    assert ready.wait(2.0)
+    assert ready.wait(ROBOT_READY_TIMEOUT_S)
     t.join(timeout=2.0)
 
 
@@ -309,9 +348,9 @@ def test_robot_finally_cleans_up_on_exception(monkeypatch):
     q = _make_queues()
     stop = threading.Event()
     ready = threading.Event()
-    q.actions_q.put(_midpoint_action())
+    q.actions_q.put(TeleopAction(joint_positions=_midpoint_action()))
     t = _start(robot_worker, q, stop, ready, None, name="robot")
-    assert ready.wait(2.0)
+    assert ready.wait(ROBOT_READY_TIMEOUT_S)
     t.join(timeout=2.0)
     assert not t.is_alive()
     assert instances[0].disabled and instances[0].disconnected
@@ -399,7 +438,8 @@ def test_retargeter_forwards_joint_positions(monkeypatch):
     actions = [x for x in items if x is not _SHUTDOWN]
     assert len(actions) > 0
     for action in actions:
-        assert isinstance(action, OrcaJointPositions)
+        assert isinstance(action, TeleopAction)
+        assert isinstance(action.joint_positions, OrcaJointPositions)
 
 
 def test_retargeter_skips_none_actions(monkeypatch):

@@ -10,7 +10,7 @@ Examples:
     python scripts/teleop_sim.py --env right
 
     # Laptop: one-command teleop with a local MediaPipe webcam publisher.
-    python scripts/teleop_sim.py --env right --local --show-video
+    python scripts/teleop_sim.py --local --hand right --show-video
 """
 
 import argparse
@@ -32,9 +32,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--env",
-        default="right",
+        default=None,
         choices=["left", "right"],
-        help="orca_sim env variant (default: right)",
+        help="orca_sim env variant (default: follows --hand)",
     )
     parser.add_argument(
         "--version", default=None, help="orca_sim embodiment version, e.g. 'v1' or 'v2'"
@@ -72,7 +72,7 @@ def main() -> None:
     )
 
     sink = OrcaHandSimSink(
-        env_name=args.env,
+        env_name=args.env or args.hand,
         version=args.version,
         render_mode=args.render_mode,
     )

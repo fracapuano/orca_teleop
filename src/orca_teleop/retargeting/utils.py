@@ -136,7 +136,7 @@ def get_urdf_model_params(
 
 def get_mano_joints_dict(joints: np.ndarray | torch.Tensor, source: str) -> dict:
     """Split a flat joint array into a per-finger dict based on source convention."""
-    if source == "mediapipe":
+    if source in ("mediapipe", "metaquest"):
         return {
             "wrist": joints[0, :],
             "thumb": joints[1:5, :],

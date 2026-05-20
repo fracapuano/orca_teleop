@@ -6,7 +6,7 @@ import threading
 
 import numpy as np
 import pytest
-from orca_core.test_mock import MockOrcaHand
+from orca_core.hardware_hand import MockOrcaHand
 
 CANONICAL_LANDMARK_SHAPE = (21, 3)
 KEYVECTORS_SHAPE = (5, 3)

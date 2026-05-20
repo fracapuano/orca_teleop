@@ -194,3 +194,7 @@ cython_debug/
 .cursorindexingignore
 
 .vscode
+
+# Local teleop calibration/debug outputs
+plots/
+recordings/

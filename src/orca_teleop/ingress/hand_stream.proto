@@ -3,6 +3,16 @@ syntax = "proto3";
 
 package orca_teleop;
 
+// 6-DoF wrist pose in the world/camera frame.
+// Optional: publishers that only track fingers may omit this entirely.
+message WristPose {
+  // 3 floats: x, y, z position in meters (world frame).
+  repeated float position = 1;
+
+  // 9 floats: row-major 3×3 rotation matrix (wrist → world).
+  repeated float rotation = 2;
+}
+
 // A single frame of hand landmark data from any input device.
 // The publisher (operator side) streams these to the robot side.
 message HandFrame {
@@ -15,6 +25,9 @@ message HandFrame {
 
   // Nanosecond timestamp from the publisher's clock.
   int64 timestamp_ns = 3;
+
+  // Optional 6-DoF wrist pose. Absent when the publisher only tracks fingers.
+  optional WristPose wrist_pose = 4;
 }
 
 // Configuration sent by the robot when a publisher connects.

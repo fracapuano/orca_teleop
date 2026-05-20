@@ -165,6 +165,7 @@ class RetargeterConfig:
         hand_config_path: PathLike | None = None,
         urdf_path: PathLike | None = None,
         *,
+        hand_type_override: str | None = None,
         lr: float = _DEFAULT_LR,
         ik_loss: IKLossFn | None = None,
         regularization_weight: float = _DEFAULT_REGULARIZATION_WEIGHT,
@@ -173,10 +174,17 @@ class RetargeterConfig:
         device = get_device()
 
         hand = OrcaHand(hand_config_path)
-        hand_type = hand.config.type
+        hand_type = hand.config.type if hand_type_override is None else hand_type_override
         if hand_type not in ("left", "right"):
             raise ValueError(
-                f"hand.config.type must be 'left' or 'right'. Check {hand_config_path}"
+                "hand type must be 'left' or 'right'. Check hand.config.type "
+                f"or hand_type_override for {hand_config_path}"
+            )
+        if hand_type_override is not None and hand.config.type != hand_type_override:
+            logger.info(
+                "Retargeter hand type override: config has %r, using %r",
+                hand.config.type,
+                hand_type_override,
             )
 
         if urdf_path is None:
@@ -300,7 +308,7 @@ class Retargeter:
     """Maps a TargetPose (raw 3D hand joints) to Orca Hand joint angles.
 
     Pipeline per call:
-        1. Source-specific preprocess (mediapipe / avp)
+        1. Source-specific preprocess (mediapipe / metaquest / avp)
         2. Normalize joints to a local hand frame
         3. (First N frames) auto-scale calibration: collect MANO key-vector
            magnitudes, then set ``mano_scale`` so MANO ≈ metres
@@ -426,7 +434,7 @@ class Retargeter:
         source = target_pose.source
 
         # Step 1: source-specific raw preprocessing
-        if source == "mediapipe":
+        if source in ("mediapipe", "metaquest"):
             joints = np.asarray(target_pose.joint_positions, dtype=float)
         elif source == "avp":
             joints = np.asarray(target_pose.joint_positions, dtype=float)
