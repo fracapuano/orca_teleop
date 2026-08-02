@@ -191,10 +191,14 @@ class AdaptiveAnalyticalRetargeter:
         hand_config_path: str | None,
         urdf_path: str | None,
         config_path: str | None,
+        hand_model: object | None = None,
     ) -> None:
         self._nlopt, self._pin, yaml = _optional_imports()
 
-        self._hand = OrcaHand(hand_config_path)
+        # ``hand_model`` (e.g. orca_teleop.hand_model.HandModel) sidesteps
+        # constructing an OrcaHand — the config.yaml may come from a different
+        # orca_core branch than the one installed here.
+        self._hand = hand_model if hand_model is not None else OrcaHand(hand_config_path)
         self.hand_type = self._hand.config.type
         if self.hand_type not in ("left", "right"):
             raise ValueError(f"hand.config.type must be 'left' or 'right', got {self.hand_type!r}")
@@ -233,8 +237,10 @@ class AdaptiveAnalyticalRetargeter:
         model_path: str | None = None,
         urdf_path: str | None = None,
         config_path: str | None = None,
+        hand_model: object | None = None,
     ) -> AdaptiveAnalyticalRetargeter:
-        return cls(hand_config_path=model_path, urdf_path=urdf_path, config_path=config_path)
+        return cls(hand_config_path=model_path, urdf_path=urdf_path,
+                   config_path=config_path, hand_model=hand_model)
 
     def reset(self) -> None:
         self._filter.reset()

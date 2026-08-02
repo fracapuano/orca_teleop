@@ -77,11 +77,23 @@ class MediaPipePublisher:
         handedness: str = "right",
         confidence: float = 0.7,
         show_video: bool = False,
+        camera_index: int = 0,
+        orientation_gate: bool = True,
     ) -> None:
         self._server_address = server_address
         self._handedness = handedness.lower()
         self._confidence = confidence
         self._show_video = show_video
+        self._camera_index = camera_index
+        # Gate frames on a plausible teleop pose (palm down, facing the
+        # camera, close enough) — garbage poses otherwise yank the
+        # retargeter. Public: toggleable at runtime (orca_ui config message).
+        self.orientation_gate = orientation_gate
+        # When True, keep a copy of every captured frame for
+        # latest_annotated_jpeg() (the orca_ui camera preview). Costs a frame
+        # copy per capture, so it's toggled on demand.
+        self.retain_frames = False
+        self._stop_event = threading.Event()
 
         # MediaPipe setup
         mediapipe_task_path = os.path.join(
@@ -106,10 +118,14 @@ class MediaPipePublisher:
         # Visualization state
         self._latest_frame: np.ndarray | None = None
         self._latest_image_landmarks = None
+        self._gate_ok = False
 
     def _on_result(self, result, _output_image, _timestamp_ms: int) -> None:
         """MediaPipe async callback — fires on each detection."""
         if not result.hand_landmarks:
+            with self._lock:
+                self._latest_image_landmarks = None
+                self._gate_ok = False
             return
 
         # Only accept the hand we care about
@@ -118,13 +134,44 @@ class MediaPipePublisher:
             return
 
         world_landmarks = result.hand_world_landmarks[0]
+        image_landmarks = result.hand_landmarks[0]
+        gate_ok = (not self.orientation_gate) or self._check_orientation(
+            world_landmarks, image_landmarks)
         keypoints = np.array([[lm.x, lm.y, lm.z] for lm in world_landmarks], dtype=np.float32)
 
         with self._lock:
-            self._latest_keypoints = keypoints
-            self._fresh = True
-            if self._show_video:
-                self._latest_image_landmarks = result.hand_landmarks[0]
+            self._latest_image_landmarks = image_landmarks
+            self._gate_ok = gate_ok
+            if gate_ok:
+                self._latest_keypoints = keypoints
+                self._fresh = True
+
+    def _check_orientation(self, world_landmarks, image_landmarks) -> bool:
+        """Plausible-teleop-pose gate (ported from the legacy ingress): palm
+        roughly face-down, facing the camera, and close enough that the
+        landmarks aren't noise."""
+        wrist = np.array([world_landmarks[0].x, world_landmarks[0].y, world_landmarks[0].z])
+        index_base = np.array([world_landmarks[5].x, world_landmarks[5].y, world_landmarks[5].z])
+        pinky_base = np.array(
+            [world_landmarks[17].x, world_landmarks[17].y, world_landmarks[17].z])
+
+        if self._handedness == "right":
+            palm_normal = np.cross(index_base - wrist, pinky_base - wrist)
+        else:
+            palm_normal = np.cross(pinky_base - wrist, index_base - wrist)
+        norm = np.linalg.norm(palm_normal)
+        if norm < 1e-9:
+            return False
+        palm_normal = palm_normal / norm
+
+        face_down_angle = np.degrees(
+            np.arccos(np.clip(np.dot(palm_normal, [0, -1, 0]), -1.0, 1.0)))
+        facing_camera = np.dot(palm_normal, [0, 0, -1]) > 0
+        image_palm_width = np.linalg.norm([
+            image_landmarks[1].x - image_landmarks[17].x,
+            image_landmarks[1].y - image_landmarks[17].y,
+        ])
+        return 90 <= face_down_angle <= 140 and facing_camera and image_palm_width > 0.05
 
     def _frame_generator(self):
         """Yield HandFrame protos as fast as new data arrives."""
@@ -146,11 +193,37 @@ class MediaPipePublisher:
                 timestamp_ns=time.time_ns(),
             )
 
+    def stop(self) -> None:
+        """Break the ``run()`` loop from another thread."""
+        self._stop_event.set()
+
+    def latest_annotated_jpeg(self, quality: int = 70,
+                              width: int = 480) -> bytes | None:
+        """Downscaled JPEG of the latest frame with the landmark skeleton
+        overlaid (green when the orientation gate passes, gray otherwise).
+        Needs ``retain_frames = True``; used for the orca_ui camera preview."""
+        with self._lock:
+            if self._latest_frame is None:
+                return None
+            frame = self._latest_frame.copy()
+            image_landmarks = self._latest_image_landmarks
+            gate_ok = self._gate_ok
+        if image_landmarks:
+            color = (0, 255, 0) if gate_ok else (140, 140, 140)
+            _draw_hand_landmarks(frame, image_landmarks, color=color)
+        height = max(1, int(frame.shape[0] * width / frame.shape[1]))
+        frame = cv2.resize(frame, (width, height))
+        ok, encoded = cv2.imencode(".jpg", frame,
+                                   [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+        return encoded.tobytes() if ok else None
+
     def run(self) -> None:
-        """Open the webcam, connect to the server, and stream until interrupted."""
-        cap = cv2.VideoCapture(0)
+        """Open the webcam, connect to the server, and stream until
+        interrupted (or ``stop()`` is called from another thread)."""
+        cap = cv2.VideoCapture(self._camera_index)
         if not cap.isOpened():
-            raise RuntimeError("Failed to open webcam")
+            raise RuntimeError(
+                f"Failed to open webcam (index {self._camera_index})")
 
         logger.info(
             "Connecting to %s (hand=%s, confidence=%.2f)",
@@ -165,12 +238,12 @@ class MediaPipePublisher:
         stream_future = stub.StreamHandFrames.future(self._frame_generator())
 
         try:
-            while True:
+            while not self._stop_event.is_set():
                 ret, frame = cap.read()
                 if not ret:
                     continue
 
-                if self._show_video:
+                if self._show_video or self.retain_frames:
                     with self._lock:
                         self._latest_frame = frame.copy()
 
@@ -180,9 +253,9 @@ class MediaPipePublisher:
 
                 if self._show_video:
                     self._display_frame()
-
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
+                    # cv2 window pump — only safe/useful with a window open
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
 
                 time.sleep(1.0 / 30.0)
 
@@ -238,6 +311,12 @@ def main() -> None:
         help="Show webcam feed with landmarks overlay",
     )
     parser.add_argument(
+        "--camera-index",
+        type=int,
+        default=0,
+        help="Webcam index (default: 0)",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -255,6 +334,7 @@ def main() -> None:
         handedness=args.hand,
         confidence=args.confidence,
         show_video=args.show_video,
+        camera_index=args.camera_index,
     )
     publisher.run()
 

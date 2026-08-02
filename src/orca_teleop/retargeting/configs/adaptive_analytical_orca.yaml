@@ -132,8 +132,15 @@ robot_frames_by_version:
           dip: left_pinky_pip
           tip: left_pinky_fingertip
 
+# config joint id -> the URDF's name for that joint. Covers both naming
+# generations against the v1 semantic URDF: v1 configs call the joint
+# thumb_pip where a v2 URDF would say thumb_cmc, and v2 configs (e.g. the
+# orca_ui hand models) call it thumb_cmc where the v1 URDF says thumb_pip.
+# Revisit when a semantic v2 URDF ships.
 joint_name_aliases:
   right:
     thumb_pip: thumb_cmc
+    thumb_cmc: thumb_pip
   left:
     thumb_pip: thumb_cmc
+    thumb_cmc: thumb_pip

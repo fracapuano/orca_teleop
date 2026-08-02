@@ -36,6 +36,7 @@ import socket
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -61,6 +62,20 @@ logger = logging.getLogger(__name__)
 
 _SHUTDOWN = object()
 LandmarkSource = Literal["mediapipe", "metaquest", "webxr"]
+
+
+def _calibration_snapshot(retargeter: Any) -> dict | None:
+    """Auto-scale calibration progress, duck-typed across both backends
+    (they share the ``_calibration_mags`` / ``_calibration_done`` attrs)."""
+    mags = getattr(retargeter, "_calibration_mags", None)
+    if mags is None:
+        return None
+    from orca_teleop.retargeting.constants import CALIBRATION_FRAMES
+
+    done = bool(getattr(retargeter, "_calibration_done", True))
+    return {"done": done,
+            "frames": CALIBRATION_FRAMES if done else len(mags),
+            "needed": CALIBRATION_FRAMES}
 
 
 def _shutdown_queue(q: "queue.Queue[Any]") -> None:
@@ -264,16 +279,25 @@ def retargeter_worker(
     retargeter_backend: RetargeterBackend = "adaptive_analytical",
     retargeter_config_path: str | None = None,
     landmarks_viz: Any | None = None,
+    retargeter: "Retargeter | None" = None,
+    wrist_provider: "Callable[[], float] | None" = None,
+    stats: Any | None = None,
     landmark_source: LandmarkSource = "mediapipe",
 ) -> None:
     """Consume ``HandLandmarks`` from the gRPC ingress, retarget, push to actions_q.
 
-    Builds a Retargeter from model_path and urdf_path, then for each incoming
-    ``HandLandmarks`` (21, 3) wraps the raw keypoints in a ``TargetPose`` and
-    calls ``retargeter.retarget()`` — the retargeter handles MANO normalization,
+    Builds a Retargeter from model_path and urdf_path (or uses a prebuilt one
+    passed as ``retargeter``), then for each incoming ``HandLandmarks`` (21, 3)
+    wraps the raw keypoints in a ``TargetPose`` and calls
+    ``retargeter.retarget()`` — the retargeter handles MANO normalization,
     auto-scale calibration, and the URDF-frame transform internally. During the
     calibration window it may return ``None``, in which case no robot command is
     enqueued yet.
+
+    ``wrist_provider`` supplies a live manual wrist angle in degrees (most
+    sources can't track the wrist). ``stats``, when given, receives
+    ``record_frame(retarget_ms, calibrating)`` per frame so a sink can report
+    pipeline health (used by the orca_ui streamer).
     """
     if landmark_source not in ("mediapipe", "metaquest", "webxr"):
         raise ValueError(
@@ -287,12 +311,13 @@ def retargeter_worker(
 
     try:
         try:
-            retargeter = Retargeter.from_paths(
-                model_path,
-                urdf_path,
-                backend=retargeter_backend,
-                config_path=retargeter_config_path,
-            )
+            if retargeter is None:
+                retargeter = Retargeter.from_paths(
+                    model_path,
+                    urdf_path,
+                    backend=retargeter_backend,
+                    config_path=retargeter_config_path,
+                )
         except Exception:
             logger.exception("Retargeter init failed; shutting down worker.")
             return
@@ -327,7 +352,12 @@ def retargeter_worker(
                 target_pose = TargetPose(
                     joint_positions=keypoints,
                     source="mediapipe",
-                    wrist_angle_degrees=item.wrist_angle_degrees,
+                    # The console supplies its own wrist angle when it drives
+                    # the streamer; otherwise the ingress frame carries it.
+                    wrist_angle_degrees=(
+                        wrist_provider() if wrist_provider is not None
+                        else item.wrist_angle_degrees
+                    ),
                 )
                 action = retargeter.retarget(target_pose)
             except (AssertionError, ValueError):
@@ -335,7 +365,11 @@ def retargeter_worker(
                 continue
             t_retarget_end = time.perf_counter()
 
-            _t_retarget_ms.append((t_retarget_end - t_retarget_start) * 1e3)
+            retarget_ms = (t_retarget_end - t_retarget_start) * 1e3
+            _t_retarget_ms.append(retarget_ms)
+            if stats is not None:
+                stats.record_frame(retarget_ms,
+                                   _calibration_snapshot(retargeter))
             if action is None:
                 continue
 

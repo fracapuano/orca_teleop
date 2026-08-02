@@ -171,10 +171,14 @@ class RetargeterConfig:
         ik_loss: IKLossFn | None = None,
         regularization_weight: float = _DEFAULT_REGULARIZATION_WEIGHT,
         joint_regularizers: tuple[tuple[str, float, float], ...] = _DEFAULT_JOINT_REGULARIZERS,
+        hand_model: object | None = None,
     ) -> "RetargeterConfig":
         device = get_device()
 
-        hand = OrcaHand(hand_config_path)
+        # ``hand_model`` (e.g. orca_teleop.hand_model.HandModel) sidesteps
+        # constructing an OrcaHand — the config.yaml may come from a different
+        # orca_core branch than the one installed here.
+        hand = hand_model if hand_model is not None else OrcaHand(hand_config_path)
         hand_type = hand.config.type
         if hand_type not in ("left", "right"):
             raise ValueError(
@@ -360,6 +364,7 @@ class Retargeter:
         *,
         backend: RetargeterBackend = "adaptive_analytical",
         config_path: str | None = None,
+        hand_model: object | None = None,
         **kwargs,
     ) -> "Retargeter":
         if backend == "adaptive_analytical":
@@ -376,6 +381,7 @@ class Retargeter:
                 model_path=model_path,
                 urdf_path=urdf_path,
                 config_path=config_path,
+                hand_model=hand_model,
             )
         if backend != "rmsprop":
             raise ValueError(
@@ -384,7 +390,8 @@ class Retargeter:
             )
         if config_path is not None:
             raise ValueError("config_path is only supported by backend='adaptive_analytical'")
-        return cls(RetargeterConfig.from_paths(model_path, urdf_path, **kwargs))
+        return cls(RetargeterConfig.from_paths(
+            model_path, urdf_path, hand_model=hand_model, **kwargs))
 
     def _ik_loss(self, target_key_vectors: torch.Tensor) -> torch.Tensor:
         cfg = self.config
