@@ -164,6 +164,7 @@ def test_retargeter_dispatches_adaptive_backend(monkeypatch):
         "model_path": "model.yaml",
         "urdf_path": "hand.urdf",
         "config_path": "retarget.yaml",
+        "hand_model": None,
     }
 
 
@@ -187,4 +188,5 @@ def test_retargeter_defaults_to_adaptive_backend(monkeypatch):
         "model_path": "model.yaml",
         "urdf_path": "hand.urdf",
         "config_path": None,
+        "hand_model": None,
     }

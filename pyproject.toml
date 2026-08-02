@@ -17,7 +17,13 @@ dependencies = [
     "grpcio>=1.62.3",
     "protobuf>=4.25.9,<5",
     "orca_core @ git+https://github.com/orcahand/orca_core.git@main",
+    # orca-teleop-streamer (the orca_ui teleop child): WS sink + config parsing
+    "websockets>=12",
+    "pyyaml>=6",
 ]
+
+[project.scripts]
+orca-teleop-streamer = "orca_teleop.streamer:main"
 
 [project.optional-dependencies]
 test = [
@@ -42,7 +48,10 @@ metaquest = [
 ]
 manus = [
     "pyzmq>=25.0",
-    "manus-client @ https://github.com/orcahand/manus-client/releases/download/v0.1.0/manus_client-0.1.0-py3-none-manylinux_2_35_x86_64.whl",
+    # The SDK wrapper wheel is manylinux-only; without the marker
+    # `uv sync --extra manus` hard-fails on macOS (where the publisher runs
+    # remotely on a Linux box anyway).
+    "manus-client @ https://github.com/orcahand/manus-client/releases/download/v0.1.0/manus_client-0.1.0-py3-none-manylinux_2_35_x86_64.whl ; sys_platform == 'linux'",
 ]
 sim = [
     "orca_sim @ git+https://github.com/orcahand/orca_sim.git@main"

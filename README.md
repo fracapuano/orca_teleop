@@ -130,3 +130,38 @@ The publisher machine hosts the WebXR page and forwards the reduced landmarks
 to the robot over gRPC. Keep `--source metaquest` on the recorder so it treats
 the incoming frames as the WebXR convention. The live adapter deliberately
 does not apply the legacy HTS/Unity handedness flip.
+
+## Streaming into the ORCA Hand Console (orca_ui)
+
+`orca-teleop-streamer` runs the ingress→retargeter pipeline headlessly and
+streams bare-name joint targets (degrees) into orca_ui's `/ws/teleop`
+WebSocket instead of commanding a hand — orca_ui owns the hand, the
+control-source arbiter, ramp-in, and the safety watchdog.
+
+Normally you never run it by hand: the console's **Teleop tab** spawns it via
+`uv run --project <this repo>` (auto-detected as a sibling checkout, or set
+`--teleop-dir` / `ORCA_TELEOP_DIR` on `orca-ui`). For a remote machine
+(e.g. the Linux box wired to Manus gloves), start a session in *external*
+mode in the UI and launch manually with the token it shows:
+
+```bash
+orca-teleop-streamer \
+    --connect ws://<console-host>:5001/ws/teleop --token <token> \
+    --source mediapipe --model-path path/to/config.yaml
+```
+
+Sources: `mediapipe` (local webcam, `--camera-index`), `manus` (see
+`docs/manus_glove_setup.md`; the SDK publisher is Linux-only, so on macOS run
+the publisher on the Linux box against this process's gRPC port), and
+`synthetic` (waveform, no hardware — wiring checks).
+
+Notes:
+- `--retargeter rmsprop` is markedly faster on CPU-only machines
+  (~12 ms/frame vs ~100 ms for `adaptive_analytical`); the console defaults
+  to it for interactive latency.
+- The retargeter URDF comes from an `orcahand_description` checkout
+  (`ORCAHAND_DESCRIPTION_DIR` or `--urdf-path`); orca_ui exports the sibling
+  checkout automatically.
+- `--list-cameras` probes webcams and prints JSON (also triggers the macOS
+  camera-permission prompt for spawned children — run orca-ui from a
+  terminal the first time).
