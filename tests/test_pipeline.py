@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 from conftest import CANONICAL_LANDMARK_SHAPE, plausible_hand_keypoints
 from orca_core import OrcaJointPositions
-from orca_core.test_mock import MockOrcaHand
+from orca_core.hardware_hand import MockOrcaHand
 
 from orca_teleop.ingress import hand_stream_pb2, hand_stream_pb2_grpc
 from orca_teleop.ingress.server import HandLandmarks, IngressServer

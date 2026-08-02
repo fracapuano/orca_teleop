@@ -1,9 +1,10 @@
 import numpy as np
 import pytest
 from orca_core import OrcaJointPositions
-from orca_core.test_mock import MockOrcaHand
+from orca_core.hardware_hand import MockOrcaHand
 
 from orca_teleop.policies import (
+    _JOINT_NAME_ALIASES,
     LeRobotACTPolicyAdapter,
     LeRobotPolicyAdapter,
     action_to_joint_positions,
@@ -40,9 +41,14 @@ def test_action_to_joint_positions_accepts_joint_mapping():
 
 
 def test_action_to_joint_positions_accepts_unprefixed_joint_mapping():
-    joint_ids = ["wrist", "thumb_pip"]
+    # v1 configs name this joint thumb_pip, v2 thumb_cmc. Target the hand's own
+    # name while the policy emits the other, so the alias is what makes it match.
+    thumb = "thumb_cmc" if "thumb_cmc" in MockOrcaHand().config.joint_ids else "thumb_pip"
+    joint_ids = ["wrist", thumb]
 
-    action = action_to_joint_positions({"wrist": 1.0, "thumb_cmc": 2.0}, joint_ids)
+    action = action_to_joint_positions(
+        {"wrist": 1.0, _JOINT_NAME_ALIASES[thumb]: 2.0}, joint_ids
+    )
 
     np.testing.assert_allclose(action.as_array(joint_ids), [1.0, 2.0])
 

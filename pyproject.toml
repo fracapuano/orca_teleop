@@ -16,7 +16,7 @@ dependencies = [
     "pytorch-kinematics",
     "grpcio>=1.62.3",
     "protobuf>=4.25.9,<5",
-    "orca_core @ file:///Users/fracapuano/Documents/orca_core",
+    "orca_core @ git+https://github.com/orcahand/orca_core.git@main",
 ]
 
 [project.optional-dependencies]
