@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import ssl
@@ -27,6 +28,11 @@ class WebXRHandSample:
     timestamp_ns: int
     landmarks: np.ndarray
     wrist_matrix: np.ndarray | None
+    # The headset pose is per-packet, not per-hand, but it is copied onto every
+    # hand sample so that a hand and the head it is paired with are always from
+    # the same instant.
+    head_matrix: np.ndarray | None = None
+    pose_epoch: int = 0
 
 
 class QuestTelemetryState:
@@ -38,7 +44,15 @@ class QuestTelemetryState:
         self._sequence_ids = {side: 0 for side in HAND_SIDES}
         self._last_update_monotonic = 0.0
 
-    def update(self, payload: Mapping[str, Any]) -> None:
+    def update(self, payload: Mapping[str, Any], fallback_epoch: int = 0) -> None:
+        """Ingest one telemetry packet.
+
+        ``fallback_epoch`` stands in for the client's own session epoch when
+        the page predates it (a cached app.js). It identifies the WebSocket
+        connection, which is a coarser but fail-safe proxy: it changes more
+        often than the XR reference space really does, which costs a spurious
+        re-clutch, whereas missing a change lets the arm lurch.
+        """
         hands = payload.get("hands", {})
         client_wall_ms = payload.get("client_wall_ms")
         timestamp_ns = (
@@ -46,6 +60,21 @@ class QuestTelemetryState:
             if isinstance(client_wall_ms, (int | float))
             else time.time_ns()
         )
+
+        session_epoch = payload.get("session_epoch")
+        pose_epoch = (
+            int(session_epoch) & 0xFFFFFFFF
+            if isinstance(session_epoch, (int | float))
+            else int(fallback_epoch)
+        )
+
+        # Decoded once per packet, outside the per-hand loop: reading it twice
+        # could pair one hand with head N and the other with head N+1.
+        head_raw = payload.get("head")
+        try:
+            head_matrix = xr_matrix_to_flu_matrix(head_raw) if head_raw is not None else None
+        except (TypeError, ValueError):
+            head_matrix = None
 
         with self._lock:
             for side in HAND_SIDES:
@@ -73,6 +102,8 @@ class QuestTelemetryState:
                     timestamp_ns=timestamp_ns,
                     landmarks=landmarks.copy(),
                     wrist_matrix=wrist_matrix,
+                    head_matrix=(None if head_matrix is None else head_matrix.copy()),
+                    pose_epoch=pose_epoch,
                 )
             self._last_update_monotonic = time.monotonic()
 
@@ -88,6 +119,8 @@ class QuestTelemetryState:
                 timestamp_ns=sample.timestamp_ns,
                 landmarks=sample.landmarks.copy(),
                 wrist_matrix=(None if sample.wrist_matrix is None else sample.wrist_matrix.copy()),
+                head_matrix=(None if sample.head_matrix is None else sample.head_matrix.copy()),
+                pose_epoch=sample.pose_epoch,
             )
 
     @property
@@ -118,6 +151,7 @@ class QuestTelemetryBridge:
         self._started = threading.Event()
         self._startup_error: BaseException | None = None
         self._telemetry_packet_count = 0
+        self._connection_epochs = itertools.count(1)
 
     @property
     def url(self) -> str:
@@ -246,6 +280,8 @@ class QuestTelemetryBridge:
         await websocket.prepare(request)
         self._websockets.add(websocket)
         peer = request.remote or "unknown"
+        # Fallback pose epoch for a cached page that does not send its own.
+        connection_epoch = next(self._connection_epochs)
         logger.info("Quest WebXR WebSocket opened from %s", peer)
         try:
             async for message in websocket:
@@ -255,7 +291,7 @@ class QuestTelemetryBridge:
                     except json.JSONDecodeError:
                         continue
                     if payload.get("type") == "telemetry":
-                        self.state.update(payload)
+                        self.state.update(payload, fallback_epoch=connection_epoch)
                         self._connected.set()
                         self._telemetry_packet_count += 1
                         if self._telemetry_packet_count <= 3:

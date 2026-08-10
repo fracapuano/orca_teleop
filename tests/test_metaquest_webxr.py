@@ -14,13 +14,14 @@ from orca_teleop.ingress.metaquest.bridge import (
 )
 from orca_teleop.ingress.metaquest.landmarks import (
     WEBXR_TO_RETARGETER_LANDMARK_INDICES,
+    QuaternionContinuity,
 )
 from orca_teleop.ingress.metaquest.publisher import MetaQuestPublisher
 from orca_teleop.ingress.server import HandLandmarks, IngressServer
 
 
-def _webxr_payload(side: str = "right") -> dict:
-    return {
+def _webxr_payload(side: str = "right", **extra) -> dict:
+    payload = {
         "type": "telemetry",
         "client_wall_ms": 1234.5,
         "hands": {
@@ -30,6 +31,15 @@ def _webxr_payload(side: str = "right") -> dict:
             }
         },
     }
+    payload.update(extra)
+    return payload
+
+
+def _xr_matrix(position=(0.0, 0.0, 0.0)) -> list[float]:
+    """A WebXR (column-major, XR basis) transform with the given translation."""
+    matrix = np.eye(4)
+    matrix[:3, 3] = position
+    return matrix.T.ravel().tolist()
 
 
 def test_telemetry_state_keeps_latest_valid_hand_sample():
@@ -91,6 +101,134 @@ def test_webxr_publisher_emits_reduced_points_and_wrist_angle():
     assert first.handedness == "right"
     assert first.wrist_angle_degrees == pytest.approx(0.0)
     assert second.wrist_angle_degrees == pytest.approx(10.0)
+
+
+def test_bridge_carries_head_matrix_in_flu_and_pose_epoch():
+    """The headset pose was received and dropped before; it is the arm's origin
+    reference for a head-relative mode."""
+    state = QuestTelemetryState()
+    # WebXR is X right, Y up, -Z forward; FLU is X forward, Y left, Z up.
+    state.update(_webxr_payload(head=_xr_matrix((1.0, 2.0, 3.0)), session_epoch=99))
+
+    sample = state.get_hand_sample("right")
+    assert sample is not None
+    assert sample.pose_epoch == 99
+    np.testing.assert_allclose(sample.head_matrix[:3, 3], [-3.0, -1.0, 2.0])
+
+
+def test_bridge_falls_back_to_the_connection_epoch():
+    """A cached page that sends no session_epoch still gets a usable one."""
+    state = QuestTelemetryState()
+    state.update(_webxr_payload(), fallback_epoch=4)
+    assert state.get_hand_sample("right").pose_epoch == 4
+
+
+def test_bridge_tolerates_a_malformed_head_matrix():
+    state = QuestTelemetryState()
+    state.update(_webxr_payload(head=[1.0, 2.0]))
+    sample = state.get_hand_sample("right")
+    assert sample is not None and sample.head_matrix is None
+
+
+def test_get_hand_sample_copies_the_head_matrix():
+    """Callers must not be able to mutate the store's own array."""
+    state = QuestTelemetryState()
+    state.update(_webxr_payload(head=_xr_matrix((1.0, 0.0, 0.0))))
+    first = state.get_hand_sample("right")
+    first.head_matrix[0, 3] = 999.0
+    assert state.get_hand_sample("right").head_matrix[0, 3] != 999.0
+
+
+def test_sample_to_proto_sets_wrist_and_head_pose():
+    publisher = MetaQuestPublisher()
+    sample = WebXRHandSample(
+        sequence_id=1,
+        timestamp_ns=42,
+        landmarks=np.arange(75, dtype=float).reshape(25, 3),
+        wrist_matrix=np.eye(4),
+        head_matrix=np.eye(4),
+        pose_epoch=5,
+    )
+
+    frame = publisher._sample_to_proto(sample)
+
+    assert frame.HasField("wrist_pose") and frame.HasField("head_pose")
+    assert frame.HasField("tracking_valid") and frame.tracking_valid is True
+    assert frame.pose_epoch == 5
+    assert (frame.wrist_pose.qw, frame.wrist_pose.px) == (1.0, 0.0)
+
+
+def test_no_wrist_matrix_leaves_wrist_pose_unset():
+    publisher = MetaQuestPublisher()
+    frame = publisher._sample_to_proto(
+        WebXRHandSample(
+            sequence_id=1,
+            timestamp_ns=42,
+            landmarks=np.arange(75, dtype=float).reshape(25, 3),
+            wrist_matrix=None,
+        )
+    )
+    assert not frame.HasField("wrist_pose")
+    assert not frame.HasField("head_pose")
+
+
+def test_arm_pose_can_be_disabled_without_touching_wrist_angle():
+    """--no-arm-pose is independent of --wrist: the hand keeps its wrist joint."""
+    pitched = np.eye(4)
+    pitch = np.radians(-10.0)
+    pitched[:3, 0] = [np.cos(pitch), 0.0, np.sin(pitch)]
+    sample = WebXRHandSample(
+        sequence_id=1,
+        timestamp_ns=42,
+        landmarks=np.arange(75, dtype=float).reshape(25, 3),
+        wrist_matrix=pitched,
+    )
+
+    with_arm = MetaQuestPublisher(arm_pose_enabled=True)
+    without_arm = MetaQuestPublisher(arm_pose_enabled=False)
+    with_arm._sample_to_proto(sample)  # prime the relative wrist zero
+    without_arm._sample_to_proto(sample)
+    frame_with = with_arm._sample_to_proto(sample)
+    frame_without = without_arm._sample_to_proto(sample)
+
+    assert not frame_without.HasField("wrist_pose")
+    assert frame_with.wrist_angle_degrees == pytest.approx(frame_without.wrist_angle_degrees)
+    assert list(frame_with.keypoints) == list(frame_without.keypoints)
+
+
+def test_quaternion_continuity_keeps_the_sign_and_resets_on_epoch():
+    estimator = QuaternionContinuity()
+    first = estimator.update(np.array([0.7071, 0.7071, 0.0, 0.0]), pose_epoch=1)
+    # The same rotation, extracted with the opposite sign.
+    second = estimator.update(np.array([-0.7071, -0.7071, 0.0, 0.0]), pose_epoch=1)
+
+    assert first[0] > 0
+    np.testing.assert_allclose(second, first, atol=1e-9)
+    assert float(np.dot(first, second)) > 0
+
+    reseeded = estimator.update(np.array([-0.7071, -0.7071, 0.0, 0.0]), pose_epoch=2)
+    assert reseeded[0] > 0  # new reference space, re-canonicalized
+
+
+def test_quaternion_continuity_survives_a_sweep_past_180_degrees():
+    """The case a naive `w >= 0` canonicalization breaks.
+
+    Rolling the wrist steadily about one axis is an operator-routine motion.
+    Feeding the canonical (w >= 0) extraction each step, the tracker must keep
+    following the continuous path — emitting a negative w past 180 deg —
+    rather than flipping and reporting a 360 deg jump that never happened.
+    """
+    estimator = QuaternionContinuity()
+    outputs = []
+    for degrees in range(0, 360, 10):
+        half = np.radians(degrees) / 2.0
+        quaternion = np.array([np.cos(half), np.sin(half), 0.0, 0.0])
+        canonical = quaternion if quaternion[0] >= 0 else -quaternion
+        outputs.append(estimator.update(canonical, pose_epoch=1))
+
+    steps = [float(np.dot(a, b)) for a, b in zip(outputs[:-1], outputs[1:], strict=True)]
+    assert min(steps) > 0.9, "continuity broken: a step flipped hemisphere"
+    assert any(q[0] < 0 for q in outputs), "never left the w >= 0 hemisphere"
 
 
 def _unused_local_port() -> int:

@@ -18,8 +18,10 @@ from typing import Any
 import grpc
 
 from orca_teleop.ingress import hand_stream_pb2, hand_stream_pb2_grpc
+from orca_teleop.ingress.frames import Pose
 from orca_teleop.ingress.metaquest.bridge import QuestTelemetryBridge, WebXRHandSample
 from orca_teleop.ingress.metaquest.landmarks import (
+    QuaternionContinuity,
     WristAngleEstimator,
     retargeter_landmarks_from_webxr,
 )
@@ -58,6 +60,7 @@ class MetaQuestPublisher:
         ssl_key: str | None = None,
         wrist_enabled: bool = True,
         wrist_scale: float = 1.0,
+        arm_pose_enabled: bool = True,
         reset_event: Any | None = None,
         bridge: QuestTelemetryBridge | None = None,
     ) -> None:
@@ -74,8 +77,13 @@ class MetaQuestPublisher:
         self._period = 1.0 / self._fps
         self._wrist_enabled = wrist_enabled
         self._wrist_scale = float(wrist_scale)
+        # Independent of ``wrist_enabled``: that one is the hand's wrist
+        # flexion joint, this one is the arm's 6-DoF target.
+        self._arm_pose_enabled = arm_pose_enabled
         self._reset_event = reset_event
         self._wrist_estimator = WristAngleEstimator()
+        self._wrist_quaternion = QuaternionContinuity()
+        self._head_quaternion = QuaternionContinuity()
         self._bridge = bridge or QuestTelemetryBridge(
             host=quest_host,
             port=quest_port,
@@ -97,18 +105,73 @@ class MetaQuestPublisher:
         self._wrist_estimator.reset()
         logger.info("Quest wrist zero reset for the next episode.")
 
+    @property
+    def arm_pose_enabled(self) -> bool:
+        return self._arm_pose_enabled
+
+    def _proto_pose(
+        self,
+        flu_matrix: Any,
+        continuity: QuaternionContinuity,
+        pose_epoch: int,
+    ) -> hand_stream_pb2.Pose | None:
+        """FLU 4x4 -> wire Pose, with a sign-continuous quaternion.
+
+        Returns None (leaving the field unset) rather than shipping a
+        degenerate pose if the matrix is not a rigid transform.
+        """
+        if flu_matrix is None:
+            return None
+        try:
+            pose = Pose.from_matrix(flu_matrix)
+        except ValueError:
+            logger.warning("Discarding a non-rigid WebXR pose matrix.", exc_info=True)
+            return None
+        position = pose.position_m
+        quaternion = continuity.update(pose.orientation_wxyz, pose_epoch)
+        return hand_stream_pb2.Pose(
+            px=position[0],
+            py=position[1],
+            pz=position[2],
+            qw=quaternion[0],
+            qx=quaternion[1],
+            qy=quaternion[2],
+            qz=quaternion[3],
+        )
+
     def _sample_to_proto(self, sample: WebXRHandSample) -> hand_stream_pb2.HandFrame:
         keypoints = retargeter_landmarks_from_webxr(sample.landmarks, self._handedness)
         wrist_angle_degrees = 0.0
         if self._wrist_enabled:
+            # Unchanged: an independent reduction of the same matrix, so the
+            # hand's wrist joint behaves exactly as before regardless of the
+            # arm path.
             wrist_angle_degrees = (
                 self._wrist_estimator.update(sample.wrist_matrix) * self._wrist_scale
             )
+
+        wrist_pose = head_pose = None
+        if self._arm_pose_enabled:
+            wrist_pose = self._proto_pose(
+                sample.wrist_matrix, self._wrist_quaternion, sample.pose_epoch
+            )
+            head_pose = self._proto_pose(
+                sample.head_matrix, self._head_quaternion, sample.pose_epoch
+            )
+
+        # Passing None for a message field leaves it unset, so the absent case
+        # needs no branching here.
         return hand_stream_pb2.HandFrame(
             keypoints=keypoints.astype("float32").ravel().tolist(),
             handedness=self._handedness,
             timestamp_ns=sample.timestamp_ns,
             wrist_angle_degrees=wrist_angle_degrees,
+            wrist_pose=wrist_pose,
+            head_pose=head_pose,
+            # A sample only exists when every joint was tracked, so any frame
+            # we emit at all is a tracked one. Tracking loss is silence.
+            tracking_valid=True,
+            pose_epoch=sample.pose_epoch,
         )
 
     def _frame_generator(self):
@@ -205,6 +268,12 @@ def main() -> None:
     )
     parser.add_argument("--wrist-scale", type=float, default=1.0)
     parser.add_argument(
+        "--arm-pose",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Publish the 6-DoF wrist and headset poses for an arm (default: enabled)",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
@@ -226,6 +295,7 @@ def main() -> None:
         ssl_key=args.ssl_key,
         wrist_enabled=args.wrist,
         wrist_scale=args.wrist_scale,
+        arm_pose_enabled=args.arm_pose,
     ).run()
 
 

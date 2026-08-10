@@ -121,6 +121,46 @@ def xr_matrix_to_flu_matrix(raw_matrix: Sequence[float]) -> np.ndarray:
     return flu_matrix
 
 
+class QuaternionContinuity:
+    """Keep the sign of successive quaternions consistent along a stream.
+
+    ``q`` and ``-q`` are the same rotation, and a matrix-to-quaternion
+    extraction picks between them by whichever matrix element happened to be
+    largest. A consumer that differences or slerps successive poses therefore
+    sees a full 360° jump for a rotation that never happened.
+
+    Note this deliberately does *not* canonicalize to ``w >= 0``: that rule
+    manufactures exactly the same discontinuity whenever the wrist passes 180°
+    from its reference, which an operator reaches routinely. Only the seed
+    frame is canonicalized; after that each quaternion is aligned to its
+    predecessor.
+    """
+
+    def __init__(self) -> None:
+        self._previous: np.ndarray | None = None
+        self._pose_epoch: int | None = None
+
+    def reset(self) -> None:
+        self._previous = None
+        self._pose_epoch = None
+
+    def update(self, quaternion_wxyz: np.ndarray, pose_epoch: int = 0) -> np.ndarray:
+        quaternion = np.asarray(quaternion_wxyz, dtype=np.float64)
+        # Across a reference-space change there is no continuity to preserve.
+        if self._pose_epoch != pose_epoch:
+            self._pose_epoch = pose_epoch
+            self._previous = None
+
+        if self._previous is None:
+            if quaternion[0] < 0.0:
+                quaternion = -quaternion
+        elif float(np.dot(quaternion, self._previous)) < 0.0:
+            quaternion = -quaternion
+
+        self._previous = quaternion
+        return quaternion
+
+
 class WristAngleEstimator:
     """Reproduce the WebXR demonstration pipeline's relative wrist control."""
 

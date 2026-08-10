@@ -12,6 +12,10 @@ let reconnectTimer = null;
 let lastTelemetrySentAtMs = -Infinity;
 let lastSocketReadyState = null;
 let telemetryPacketCount = 0;
+// Identifies the XR reference space these poses live in. WebXR re-pins "local"
+// on every new session, so poses from before and after are not comparable —
+// the arm side must re-capture its origin when this changes.
+let sessionEpoch = 0;
 
 const TARGET_TELEMETRY_HZ = 60;
 const MAX_TELEMETRY_BUFFERED_AMOUNT = 128 * 1024;
@@ -154,6 +158,7 @@ function sendTelemetry(frame, pose, referenceSpace, nowMs) {
     type: "telemetry",
     timestamp_ms: nowMs,
     client_wall_ms: Date.now(),
+    session_epoch: sessionEpoch,
     head: matrixToArray(pose.transform.matrix),
     hands: {},
   };
@@ -231,6 +236,10 @@ async function startImmersiveSession() {
   } catch (_error) {
     refSpace = await session.requestReferenceSpace("local-floor");
   }
+  // Stamped once the reference space exists, so every pose sent under this
+  // epoch really is expressed in this space. Wall-clock ms truncated to 32
+  // bits: it only has to differ from the previous session's value.
+  sessionEpoch = Date.now() % 0xffffffff;
 
   session.addEventListener("end", () => {
     setStatus("XR session ended.");
