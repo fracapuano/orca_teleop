@@ -3,22 +3,106 @@ syntax = "proto3";
 
 package orca_teleop;
 
+// A rigid-body pose in the robot's forward-left-up (FLU) basis: X forward,
+// Y left, Z up. Translation is in METERS. Rotation is a Hamilton UNIT
+// quaternion in w-FIRST order. The equivalent 4x4 homogeneous transform T
+// composes as p_ref = T * p_body.
+//
+// This is exactly what metaquest/landmarks.py::xr_matrix_to_flu_matrix
+// already produces, and it is also the LimX TRON dual-arm convention: its
+// end-effector poses are metres xyz plus a w-first quaternion, and its
+// MoveP workspace limits (left arm y in [-0.213, 0.900], right arm y in
+// [-0.900, 0.213]) put +Y on the left, i.e. FLU. A Pose therefore maps onto
+// a TRON `left_pos`/`right_pos` element-for-element with no conversion.
+//
+// REFERENCE FRAME: the origin is the PUBLISHER's own tracking space. It is
+// not a world frame and not the robot's frame. For the Quest it is the
+// WebXR "local" space, pinned wherever the headset was when the XR session
+// started, and re-pinned on every new session. Consume these poses
+// RELATIVELY, and re-arm whenever HandFrame.pose_epoch changes.
+//
+// An all-default Pose has qw=0 -- the ZERO quaternion, NOT identity. The
+// ingress server rejects any Pose whose quaternion norm differs from 1 by
+// more than 1e-3, and treats that frame as carrying no pose at all.
+message Pose {
+  double px = 1;
+  double py = 2;
+  double pz = 3;
+  double qw = 4;
+  double qx = 5;
+  double qy = 6;
+  double qz = 7;
+}
+
 // A single frame of hand landmark data from any input device.
 // The publisher (operator side) streams these to the robot side.
 message HandFrame {
-  // 63 floats: 21 landmarks × 3 coordinates (x, y, z), row-major.
-  // Coordinates are in meters, wrist-relative, following MediaPipe convention.
+  // 63 floats: 21 landmarks × 3 coordinates (x, y, z), row-major, in meters,
+  // following the MediaPipe joint layout.
+  //
+  // Translation-invariant by contract, not by value: MediaPipe and Manus
+  // publishers send these wrist-relative, while the WebXR publisher sends
+  // them absolute in its reference space (retargeter_landmarks_from_webxr
+  // only selects 21 of WebXR's 25 joints and does not re-centre). Both work
+  // because the retargeter re-centres internally. Do NOT derive a wrist
+  // position from keypoints[0] -- use wrist_pose, which is explicitly
+  // frame-defined.
   repeated float keypoints = 1;
 
   // "left" or "right"
   string handedness = 2;
 
-  // Nanosecond timestamp from the publisher's clock.
+  // Nanosecond timestamp from the PUBLISHER's wall clock. Not comparable to
+  // the robot host's clock, and not monotonic across a publisher restart.
+  // Never use it for staleness -- the ingress server stamps its own
+  // monotonic receive time (TeleopFrame.recv_monotonic_ns).
   int64 timestamp_ns = 3;
 
   // Relative wrist flexion from publishers that provide a wrist pose.
-  // Publishers without wrist tracking leave this at zero.
+  // Publishers without wrist tracking leave this at zero. Zeroed against the
+  // publisher's own first frame, so it is NOT expressed in the same
+  // reference as wrist_pose; the two are independent products of the same
+  // underlying matrix.
   float wrist_angle_degrees = 4;
+
+  // Operator wrist pose, sampled at the SAME instant as keypoints. This is
+  // the 6-DoF arm target.
+  //
+  // ABSENT means "this publisher has no 6-DoF wrist pose for this frame"
+  // (MediaPipe, Manus and synthetic: always). Absent is NOT (0,0,0): a wrist
+  // genuinely at the reference origin is sent PRESENT with px=py=pz=0.
+  // Consumers MUST branch on HasField("wrist_pose").
+  //
+  // No `optional` keyword: proto3 message fields already have explicit
+  // presence, so HasField works without it; adding it would only inject a
+  // synthetic oneof into the descriptor.
+  Pose wrist_pose = 5;
+
+  // Headset pose at the same instant, in the SAME reference space as
+  // wrist_pose, for a head-referenced relative mode.
+  //
+  // This is a LIVE, per-frame, MOVING pose. It is NOT a latched calibration
+  // origin: computing T_head^-1 * T_wrist every frame makes the arm follow
+  // the operator's head. Absent for publishers with no headset.
+  Pose head_pose = 6;
+
+  // The publisher's own opinion of this frame's tracking quality.
+  // ABSENT => decode as TRUE (an old publisher tracks fine; it just cannot
+  // say so). `optional` IS load-bearing here: bool is a scalar, so without
+  // it "false" and "never set" collapse, and every MediaPipe and Manus frame
+  // would decode as invalid.
+  //
+  // NOT a liveness signal. The Quest expresses tracking loss as SILENCE --
+  // no frame at all -- so this is true whenever it is present. Liveness is a
+  // host-side staleness deadline, not this field.
+  optional bool tracking_valid = 7;
+
+  // Generation counter for the reference space wrist_pose and head_pose live
+  // in. It changes whenever that space is re-established: a new XR session,
+  // the headset handed to another person, a publisher restart. Poses either
+  // side of a change are NOT comparable -- a relative-mode origin must be
+  // re-captured or the arm lurches. 0 => the publisher does not track it.
+  uint32 pose_epoch = 8;
 }
 
 // Configuration sent by the robot when a publisher connects.
