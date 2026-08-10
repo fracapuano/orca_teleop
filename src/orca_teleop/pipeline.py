@@ -38,7 +38,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from orca_core import OrcaHand, OrcaJointPositions
@@ -57,6 +57,9 @@ from orca_teleop.constants import (
 )
 from orca_teleop.ingress.server import HandLandmarks, IngressServer
 from orca_teleop.retargeting.retargeter import Retargeter, RetargeterBackend, TargetPose
+
+if TYPE_CHECKING:
+    from orca_teleop.arm import ArmSink
 
 logger = logging.getLogger(__name__)
 
@@ -466,9 +469,11 @@ def run(
     retargeter_backend: RetargeterBackend = "adaptive_analytical",
     retargeter_config_path: str | None = None,
     landmark_source: LandmarkSource = "mediapipe",
+    arm_sink: "ArmSink | None" = None,
 ) -> None:
     """Start the full teleop pipeline:
     - gRPC-ingress -> retargeter -> robot consumer
+    - gRPC-ingress -> arm consumer (optional, in parallel)
 
     The robot-side machine runs this function. A publisher running on *any*
     machine (same host, a laptop across the room, etc.) connects via gRPC and
@@ -489,6 +494,10 @@ def run(
         landmark_source: Landmark convention received over gRPC. Live ``webxr``
             frames are already in the canonical 21-point layout; legacy
             ``metaquest`` HTS/Unity replays still need their historical mirror.
+        arm_sink: Optional consumer of the operator's 6-DoF wrist pose, driven
+            from the same ingress frames as the hand but at ingress rate
+            rather than retargeter rate. Only publishers that send a wrist
+            pose (currently the Quest WebXR one) feed it.
     """
     if sink is None:
         sink = OrcaHandSink(model_path)
@@ -513,9 +522,34 @@ def run(
             model_path = sink_model_path
             logger.info("Using sink-provided retargeter model: %s", model_path)
 
+    # Before the port opens, on the main thread: a dead arm should abort
+    # startup rather than surface as a silent hold once frames are flowing.
+    if arm_sink is not None:
+        try:
+            arm_sink.connect()
+        except Exception:
+            # The hand is already connected and torque-enabled at this point;
+            # do not leave it that way because the arm failed.
+            sink.close()
+            raise
+
     ingress_server = IngressServer(queues.landmarks_q, stop_event, port=port)
     ingress_server.start()
 
+    arm_thread: threading.Thread | None = None
+    if arm_sink is not None:
+        from orca_teleop.arm import arm_worker
+
+        arm_thread = threading.Thread(
+            target=arm_worker,
+            kwargs=dict(
+                frames=ingress_server.frames,
+                sink=arm_sink,
+                stop_event=stop_event,
+            ),
+            name="arm",
+        )
+        arm_thread.start()
 
     # Keyword-only: retargeter_worker takes ``retargeter`` before
     # ``landmark_source``, so a positional tail silently binds the source
@@ -546,6 +580,8 @@ def run(
         # of wait_for_next(); join it after, never before.
         ingress_server.stop()
         retargeter_thread.join(timeout=JOIN_TIMEOUT)
+        if arm_thread is not None:
+            arm_thread.join(timeout=JOIN_TIMEOUT)
         sink.close()
         if landmarks_viz is not None:
             landmarks_viz.stop()
@@ -763,8 +799,13 @@ def run_metaquest_local(
     visualize_landmarks: bool = False,
     retargeter_backend: RetargeterBackend = "adaptive_analytical",
     retargeter_config_path: str | None = None,
+    arm_sink: "ArmSink | None" = None,
 ) -> None:
-    """Run ``run()`` plus a local Quest WebXR publisher for one-command teleop."""
+    """Run ``run()`` plus a local Quest WebXR publisher for one-command teleop.
+
+    This is the path that drives an arm: the Quest is currently the only
+    publisher with a 6-DoF wrist pose. Pass ``arm_sink`` to consume it.
+    """
     import multiprocessing
 
     print(
@@ -809,6 +850,7 @@ def run_metaquest_local(
             retargeter_backend=retargeter_backend,
             retargeter_config_path=retargeter_config_path,
             landmark_source="webxr",
+            arm_sink=arm_sink,
         )
     finally:
         if publisher_process.is_alive():

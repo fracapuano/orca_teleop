@@ -16,6 +16,7 @@ from orca_core.hardware_hand import MockOrcaHand
 
 from orca_teleop.constants import MOTION_NUM_STEPS
 from orca_teleop.ingress import hand_stream_pb2, hand_stream_pb2_grpc
+from orca_teleop.ingress.frames import Pose
 from orca_teleop.ingress.server import HandLandmarks, IngressServer
 from orca_teleop.pipeline import (
     _SHUTDOWN,
@@ -671,6 +672,145 @@ def test_retargeter_worker_passes_backend_and_config(monkeypatch):
     }
 
 
+def _pose_proto(px=0.0, py=0.0, pz=0.0, quaternion=(1.0, 0.0, 0.0, 0.0)):
+    qw, qx, qy, qz = quaternion
+    return hand_stream_pb2.Pose(px=px, py=py, pz=pz, qw=qw, qx=qx, qy=qy, qz=qz)
+
+
+def test_hand_frame_field_numbers_are_stable():
+    """Renumbering after the arm controller ships is a silent wire break."""
+    fields = hand_stream_pb2.HandFrame.DESCRIPTOR.fields_by_name
+    assert fields["keypoints"].number == 1
+    assert fields["handedness"].number == 2
+    assert fields["timestamp_ns"].number == 3
+    assert fields["wrist_angle_degrees"].number == 4
+    assert fields["wrist_pose"].number == 5
+    assert fields["head_pose"].number == 6
+    assert fields["tracking_valid"].number == 7
+    assert fields["pose_epoch"].number == 8
+    # Presence is what lets the arm tell "no pose" from "pose at the origin".
+    assert fields["wrist_pose"].has_presence
+    assert fields["tracking_valid"].has_presence
+
+
+def _stream_one_frame(server_port: int, frame: hand_stream_pb2.HandFrame) -> int:
+    channel = grpc.insecure_channel(f"localhost:{server_port}")
+    try:
+        stub = hand_stream_pb2_grpc.HandStreamStub(channel)
+        return stub.StreamHandFrames(iter([frame])).frames_received
+    finally:
+        channel.close()
+
+
+def test_wire_frame_with_wrist_pose_reaches_the_arm_slot():
+    """End to end over real gRPC: publisher -> server.frames."""
+    q = queue.Queue(maxsize=8)
+    stop = threading.Event()
+    server = IngressServer(q, stop, port=0)
+    port = server.start()
+    try:
+        kp = np.zeros(CANONICAL_LANDMARK_SHAPE, dtype=np.float32)
+        assert (
+            _stream_one_frame(
+                port,
+                hand_stream_pb2.HandFrame(
+                    keypoints=kp.ravel().tolist(),
+                    handedness="right",
+                    timestamp_ns=7,
+                    wrist_pose=_pose_proto(px=0.1, py=0.2, pz=0.3),
+                    head_pose=_pose_proto(pz=1.5),
+                    tracking_valid=True,
+                    pose_epoch=11,
+                ),
+            )
+            == 1
+        )
+
+        frame = server.frames.get_fresh(max_age_s=10.0)
+        assert frame is not None
+        np.testing.assert_allclose(frame.wrist_position_m, [0.1, 0.2, 0.3])
+        np.testing.assert_allclose(frame.wrist_orientation_wxyz, [1.0, 0.0, 0.0, 0.0])
+        assert frame.head is not None
+        assert frame.pose_epoch == 11
+        assert frame.stream_id > 0
+        assert frame.recv_monotonic_ns > 0
+        assert frame.tracking_valid
+
+        # The same frame still reached the hand path, carrying the pose.
+        landmark = q.get_nowait()
+        assert isinstance(landmark.wrist_pose, Pose)
+    finally:
+        server.stop()
+
+
+def test_old_publisher_frame_leaves_the_arm_slot_empty():
+    """Fields 1-4 only: the hand path is byte-identical to before, and the arm
+    correctly sees nothing rather than a pose at the origin."""
+    q = queue.Queue(maxsize=8)
+    stop = threading.Event()
+    server = IngressServer(q, stop, port=0)
+    port = server.start()
+    try:
+        kp = np.zeros(CANONICAL_LANDMARK_SHAPE, dtype=np.float32)
+        assert (
+            _stream_one_frame(
+                port,
+                hand_stream_pb2.HandFrame(
+                    keypoints=kp.ravel().tolist(),
+                    handedness="right",
+                    timestamp_ns=7,
+                    wrist_angle_degrees=9.0,
+                ),
+            )
+            == 1
+        )
+
+        assert server.frames.get_unchecked()[0] is None
+        landmark = q.get_nowait()
+        assert landmark.wrist_pose is None
+        assert landmark.head_pose is None
+        assert landmark.wrist_angle_degrees == pytest.approx(9.0)
+        # Absent must decode as True, or every MediaPipe frame reads as invalid.
+        assert landmark.tracking_valid is True
+    finally:
+        server.stop()
+
+
+def test_zero_quaternion_pose_is_rejected_but_the_hand_frame_survives():
+    """An all-default Pose has qw=0. It must not become a NaN arm target."""
+    q = queue.Queue(maxsize=8)
+    stop = threading.Event()
+    server = IngressServer(q, stop, port=0)
+    port = server.start()
+    try:
+        kp = np.zeros(CANONICAL_LANDMARK_SHAPE, dtype=np.float32)
+        assert (
+            _stream_one_frame(
+                port,
+                hand_stream_pb2.HandFrame(
+                    keypoints=kp.ravel().tolist(),
+                    handedness="right",
+                    timestamp_ns=7,
+                    wrist_pose=hand_stream_pb2.Pose(),
+                ),
+            )
+            == 1
+        )
+
+        assert server.frames.get_unchecked()[0] is None
+        assert q.get_nowait().wrist_pose is None  # hand path unaffected
+    finally:
+        server.stop()
+
+
+def test_ingress_stop_closes_the_arm_slot():
+    q = queue.Queue(maxsize=4)
+    server = IngressServer(q, threading.Event(), port=0)
+    server.start()
+    server.stop()
+    assert server.frames.wait_for_next(last_seq=0, timeout=1.0).closed
+
+
 class _ImmediateSink(RobotSink):
     """A sink whose run_loop returns at once, so run() can be exercised."""
 
@@ -740,6 +880,134 @@ def test_retargeter_drain_keeps_the_frame_before_the_sentinel(monkeypatch, patch
     t.join(timeout=2.0)
     assert not t.is_alive()
     assert len(seen) == 1, "the frame ahead of the shutdown sentinel was dropped"
+
+
+def test_arm_path_is_not_gated_by_the_retargeter(monkeypatch):
+    """The design claim, made executable.
+
+    One publisher, one ingress, two consumers: a deliberately slow retargeter
+    and the arm worker. The arm must keep up with the wire while the hand
+    falls behind — that is the whole reason wrist pose is a passthrough rather
+    than another retargeter output.
+    """
+    from orca_teleop.arm import ArmSink, arm_worker
+
+    class _SlowRetargeter:
+        @classmethod
+        def from_paths(cls, *_args, **_kwargs):
+            return cls()
+
+        def retarget(self, _target_pose):
+            time.sleep(0.2)  # ~ the real adaptive_analytical cost
+            return _midpoint_action()
+
+    monkeypatch.setattr("orca_teleop.pipeline.Retargeter", _SlowRetargeter)
+
+    class _CountingArmSink(ArmSink):
+        def __init__(self):
+            self.dispatched = 0
+
+        def connect(self): ...
+
+        def dispatch(self, frame):
+            self.dispatched += 1
+
+        def on_hold(self, reason): ...
+
+        def on_reference_change(self, stream_id, pose_epoch): ...
+
+        def close(self): ...
+
+    queues = _make_queues()
+    stop = threading.Event()
+    server = IngressServer(queues.landmarks_q, stop, port=0)
+    port = server.start()
+    arm_sink = _CountingArmSink()
+
+    retargeter_thread = _start(retargeter_worker, queues, stop, None, name="retargeter")
+    arm_thread = threading.Thread(
+        target=arm_worker,
+        kwargs=dict(frames=server.frames, sink=arm_sink, stop_event=stop),
+        daemon=True,
+    )
+    arm_thread.start()
+
+    n_frames = 40
+    kp = np.zeros(CANONICAL_LANDMARK_SHAPE, dtype=np.float32)
+
+    def gen_frames():
+        for index in range(n_frames):
+            yield hand_stream_pb2.HandFrame(
+                keypoints=kp.ravel().tolist(),
+                handedness="right",
+                timestamp_ns=index,
+                wrist_pose=_pose_proto(px=index * 0.001),
+            )
+            time.sleep(1 / 60)
+
+    channel = grpc.insecure_channel(f"localhost:{port}")
+    try:
+        stub = hand_stream_pb2_grpc.HandStreamStub(channel)
+        assert stub.StreamHandFrames(gen_frames()).frames_received == n_frames
+        time.sleep(0.1)
+        dispatched = arm_sink.dispatched
+    finally:
+        channel.close()
+        stop.set()
+        server.stop()
+        retargeter_thread.join(timeout=3.0)
+        arm_thread.join(timeout=3.0)
+
+    actions = sum(
+        1
+        for _ in iter(
+            lambda: queues.actions_q.get_nowait() if not queues.actions_q.empty() else None,
+            None,
+        )
+    )
+    # ~0.66 s of wire; the retargeter can manage only a handful at 200 ms each.
+    assert dispatched > 15, f"arm only saw {dispatched} of {n_frames} frames"
+    assert dispatched > 3 * actions, f"arm={dispatched} tracked the hand rate={actions}"
+
+
+def test_run_starts_and_joins_the_arm_thread(monkeypatch, patch_mock_hand):
+    from orca_teleop.arm import ArmSink
+
+    events: list[str] = []
+
+    class _StubArmSink(ArmSink):
+        def connect(self):
+            events.append("connect")
+
+        def dispatch(self, frame):
+            events.append("dispatch")
+
+        def on_hold(self, reason):
+            pass
+
+        def on_reference_change(self, stream_id, pose_epoch):
+            pass
+
+        def close(self):
+            events.append("close")
+
+    real_get = queue.Queue.get
+    calls = {"n": 0}
+    main_ident = threading.main_thread().ident
+
+    def fake_get(self, *args, **kwargs):
+        if threading.get_ident() == main_ident:
+            calls["n"] += 1
+            if calls["n"] >= 3:
+                raise KeyboardInterrupt
+        return real_get(self, *args, **kwargs)
+
+    monkeypatch.setattr(queue.Queue, "get", fake_get)
+
+    run(None, arm_sink=_StubArmSink())
+    time.sleep(0.05)
+    assert "arm" not in {t.name for t in threading.enumerate() if t.is_alive()}
+    assert events[0] == "connect" and "close" in events
 
 
 def test_retargeter_skips_none_actions(monkeypatch):
