@@ -16,6 +16,7 @@ from orca_teleop.ingress.metaquest.landmarks import (
     WEBXR_TO_RETARGETER_LANDMARK_INDICES,
     QuaternionContinuity,
 )
+from orca_teleop.ingress.metaquest.mock_publisher import MockQuestBridge, synthetic_payload
 from orca_teleop.ingress.metaquest.publisher import MetaQuestPublisher
 from orca_teleop.ingress.server import HandLandmarks, IngressServer
 
@@ -229,6 +230,60 @@ def test_quaternion_continuity_survives_a_sweep_past_180_degrees():
     steps = [float(np.dot(a, b)) for a, b in zip(outputs[:-1], outputs[1:], strict=True)]
     assert min(steps) > 0.9, "continuity broken: a step flipped hemisphere"
     assert any(q[0] < 0 for q in outputs), "never left the w >= 0 hemisphere"
+
+
+def test_mock_payload_flows_through_the_real_bridge_and_publisher():
+    """The headset-free mock must exercise the production path, not a copy."""
+    state = QuestTelemetryState()
+    state.update(synthetic_payload(elapsed_s=1.0, side="right", pose_epoch=3))
+
+    sample = state.get_hand_sample("right")
+    assert sample is not None
+    assert sample.landmarks.shape == (25, 3)
+    assert sample.pose_epoch == 3
+
+    frame = MetaQuestPublisher()._sample_to_proto(sample)
+    assert len(frame.keypoints) == 63
+    assert frame.HasField("wrist_pose") and frame.HasField("head_pose")
+    assert frame.pose_epoch == 3
+    quaternion = np.array(
+        [frame.wrist_pose.qw, frame.wrist_pose.qx, frame.wrist_pose.qy, frame.wrist_pose.qz]
+    )
+    assert np.linalg.norm(quaternion) == pytest.approx(1.0, abs=1e-9)
+    # FLU: the operator's wrist is out in front (+x) and above the floor (+z).
+    assert frame.wrist_pose.px > 0.0
+    assert frame.wrist_pose.pz > 0.5
+
+
+def test_mock_hand_is_never_degenerate_for_the_retargeter():
+    """A collapsed wrist-to-middle axis would make the retargeter reject frames."""
+    for elapsed_s in np.linspace(0.0, 12.0, 60):
+        landmarks = np.asarray(
+            synthetic_payload(elapsed_s, "right", 1)["hands"]["right"]["landmarks"]
+        )
+        reduced = landmarks[list(WEBXR_TO_RETARGETER_LANDMARK_INDICES)]
+        centered = reduced - reduced[0]
+        assert np.linalg.norm(centered[9]) > 1e-3  # wrist -> middle MCP
+        assert np.isfinite(centered).all()
+
+
+def test_mock_dropout_removes_the_hand_entirely():
+    """Tracking loss is silence: the Quest cannot send tracking_valid=false."""
+    state = QuestTelemetryState()
+    state.update(synthetic_payload(0.0, "right", 1))
+    assert state.get_hand_sample("right") is not None
+
+    state.update({"type": "telemetry", "hands": {}})
+    assert state.get_hand_sample("right") is None
+
+
+def test_mock_bridge_satisfies_the_publisher_interface():
+    """MockQuestBridge is duck-typed; a rename in the real bridge must show up."""
+    bridge = MockQuestBridge(side="right", fps=30)
+    for attribute in ("state", "start", "stop", "url", "ssl_context"):
+        assert hasattr(bridge, attribute)
+    publisher = MetaQuestPublisher(bridge=bridge)
+    assert publisher.bridge is bridge
 
 
 def _unused_local_port() -> int:
