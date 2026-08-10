@@ -13,6 +13,12 @@ _NUM_KEYPOINTS = 21
 _COORDS_PER_POINT = 3
 _EXPECTED_LEN = _NUM_KEYPOINTS * _COORDS_PER_POINT  # 63
 
+# Arm (6-DoF wrist pose) path. The arm consumes the latest ingress frame
+# directly and is never gated on the retargeter.
+ARM_STALE_AFTER_S = 0.25  # ~8 missed frames at 30 Hz -> hold
+ARM_OWNER_TAKEOVER_S = 2.0  # silence before another publisher may take the slot
+QUATERNION_NORM_TOLERANCE = 1e-3
+
 SIM_RENDER_MODE = "human"
 
 DEFAULT_CAMERA_WIDTH = 640
