@@ -322,13 +322,10 @@ def retargeter_worker(
             logger.exception("Retargeter init failed; shutting down worker.")
             return
 
-        while not stop_event.is_set():
-            try:
-                item = queues.landmarks_q.get(timeout=HEARTBEAT_INTERVAL)
-            except queue.Empty:
-                continue
-            if item is _SHUTDOWN:
-                break
+        def process(item: HandLandmarks) -> None:
+            """Retarget one frame. Early returns here, never ``continue``, so
+            no skip path can bypass the shutdown check in the caller."""
+            nonlocal _t_window_start
 
             if not isinstance(item, HandLandmarks):
                 raise ValueError(f"Expected instance of HandLandmarks, got {type(item)}")
@@ -362,7 +359,7 @@ def retargeter_worker(
                 action = retargeter.retarget(target_pose)
             except (AssertionError, ValueError):
                 logger.debug("Skipping degenerate landmark frame.")
-                continue
+                return
             t_retarget_end = time.perf_counter()
 
             retarget_ms = (t_retarget_end - t_retarget_start) * 1e3
@@ -371,7 +368,7 @@ def retargeter_worker(
                 stats.record_frame(retarget_ms,
                                    _calibration_snapshot(retargeter))
             if action is None:
-                continue
+                return
 
             try:
                 queues.actions_q.put_nowait(action)
@@ -391,6 +388,34 @@ def retargeter_worker(
                 )
                 _t_retarget_ms.clear()
                 _t_window_start = time.perf_counter()
+
+        while not stop_event.is_set():
+            try:
+                item = queues.landmarks_q.get(timeout=HEARTBEAT_INTERVAL)
+            except queue.Empty:
+                continue
+
+            # Latest-wins, mirroring ui_sink's drain: the ingress fills this
+            # queue faster than the retargeter drains it, so without this it
+            # sits permanently full and every retarget runs on the oldest of
+            # QUEUES_MAXSIZE frames — a fixed backlog on top of the retarget
+            # cost, while the arm path is at ~0 ms. A shutdown sentinel found
+            # while draining still lets the final coalesced frame through.
+            shutdown = item is _SHUTDOWN
+            while not shutdown:
+                try:
+                    newer = queues.landmarks_q.get_nowait()
+                except queue.Empty:
+                    break
+                if newer is _SHUTDOWN:
+                    shutdown = True
+                else:
+                    item = newer
+
+            if item is not _SHUTDOWN:
+                process(item)
+            if shutdown:
+                break
     finally:
         _shutdown_queue(queues.actions_q)
 
@@ -491,17 +516,21 @@ def run(
     ingress_server = IngressServer(queues.landmarks_q, stop_event, port=port)
     ingress_server.start()
 
+
+    # Keyword-only: retargeter_worker takes ``retargeter`` before
+    # ``landmark_source``, so a positional tail silently binds the source
+    # string to the retargeter slot.
     retargeter_thread = threading.Thread(
         target=retargeter_worker,
-        args=(
-            queues,
-            stop_event,
-            model_path,
-            urdf_path,
-            retargeter_backend,
-            retargeter_config_path,
-            landmarks_viz,
-            landmark_source,
+        kwargs=dict(
+            queues=queues,
+            stop_event=stop_event,
+            model_path=model_path,
+            urdf_path=urdf_path,
+            retargeter_backend=retargeter_backend,
+            retargeter_config_path=retargeter_config_path,
+            landmarks_viz=landmarks_viz,
+            landmark_source=landmark_source,
         ),
         name="retargeter",
     )
@@ -513,6 +542,8 @@ def run(
         pass
     finally:
         stop_event.set()
+        # stop() closes the frame slot, which is what wakes the arm thread out
+        # of wait_for_next(); join it after, never before.
         ingress_server.stop()
         retargeter_thread.join(timeout=JOIN_TIMEOUT)
         sink.close()

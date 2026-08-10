@@ -14,10 +14,12 @@ from conftest import CANONICAL_LANDMARK_SHAPE, plausible_hand_keypoints
 from orca_core import OrcaJointPositions
 from orca_core.hardware_hand import MockOrcaHand
 
+from orca_teleop.constants import MOTION_NUM_STEPS
 from orca_teleop.ingress import hand_stream_pb2, hand_stream_pb2_grpc
 from orca_teleop.ingress.server import HandLandmarks, IngressServer
 from orca_teleop.pipeline import (
     _SHUTDOWN,
+    RobotSink,
     TeleopQueues,
     retargeter_worker,
     robot_worker,
@@ -400,7 +402,12 @@ def test_orca_hand_sink_go_home(monkeypatch):
     sink.close()
 
     hand = instances[0]
-    assert hand.joint_calls == [({"wrist": 0.0, "thumb_mcp": 33.0}, 1)]
+    # go_home sends an OrcaJointPositions (not a bare dict) and takes the slow
+    # path, 5 * MOTION_NUM_STEPS, since it runs between episodes.
+    assert len(hand.joint_calls) == 1
+    action, num_steps = hand.joint_calls[0]
+    assert dict(action.as_dict()) == {"wrist": 0.0, "thumb_mcp": 33.0}
+    assert num_steps == 5 * MOTION_NUM_STEPS
 
 
 def test_orca_hand_sink_go_home_skipped_without_hardware(monkeypatch):
@@ -662,6 +669,77 @@ def test_retargeter_worker_passes_backend_and_config(monkeypatch):
             "config_path": "retarget.yaml",
         },
     }
+
+
+class _ImmediateSink(RobotSink):
+    """A sink whose run_loop returns at once, so run() can be exercised."""
+
+    def connect(self) -> None: ...
+
+    def run_loop(self, actions_q, stop_event) -> None: ...
+
+    def close(self) -> None: ...
+
+
+def test_run_passes_worker_arguments_by_keyword(monkeypatch):
+    """Regression: run() used to pass a positional tail to retargeter_worker,
+    whose 8th parameter is `retargeter`, not `landmark_source`. That bound
+    retargeter="webxr", so no Retargeter was ever built and the first real
+    frame killed the thread with AttributeError."""
+    captured: dict = {}
+
+    def fake_worker(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr("orca_teleop.pipeline.retargeter_worker", fake_worker)
+
+    run(None, sink=_ImmediateSink(), port=0, landmark_source="webxr")
+
+    assert captured["args"] == (), "run() must not bind worker parameters positionally"
+    assert captured["kwargs"]["landmark_source"] == "webxr"
+    # Left to its default rather than accidentally receiving the source string.
+    assert captured["kwargs"].get("retargeter") is None
+
+
+def test_retargeter_drain_keeps_the_frame_before_the_sentinel(monkeypatch, patch_mock_hand):
+    """The latest-wins drain must still process the newest real frame when a
+    shutdown sentinel is found behind it."""
+    seen: list = []
+
+    class _StubRetargeter:
+        @classmethod
+        def from_paths(cls, *_args, **_kwargs):
+            return cls()
+
+        def retarget(self, target_pose):
+            seen.append(target_pose)
+            return _midpoint_action()
+
+    monkeypatch.setattr("orca_teleop.pipeline.Retargeter", _StubRetargeter)
+
+    queues = _make_queues()
+    stop = threading.Event()
+    queues.landmarks_q.put(_make_landmark())
+    queues.landmarks_q.put(_SHUTDOWN)
+    t = _start(
+        retargeter_worker,
+        queues,
+        stop,
+        None,
+        None,
+        "adaptive_analytical",
+        None,
+        None,
+        None,
+        None,
+        None,
+        "webxr",
+        name="retargeter",
+    )
+    t.join(timeout=2.0)
+    assert not t.is_alive()
+    assert len(seen) == 1, "the frame ahead of the shutdown sentinel was dropped"
 
 
 def test_retargeter_skips_none_actions(monkeypatch):
