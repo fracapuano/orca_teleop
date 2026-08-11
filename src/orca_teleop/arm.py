@@ -140,7 +140,13 @@ def arm_worker(
                 logger.info("Ingress closed; stopping the arm worker.")
                 break
             if not update.fresh:
-                enter_hold("no_frames")
+                # A wakeup with no new frame is not yet a hold: poll_timeout_s
+                # is only how often we look, whereas stale_after_s is the
+                # actual liveness deadline. Holding on the poll interval would
+                # freeze the arm after ~3 missed frames at 30 Hz.
+                previous = update.frame
+                if previous is None or previous.age_s > stale_after_s:
+                    enter_hold("no_frames")
                 continue
 
             last_seq = update.seq
@@ -165,14 +171,17 @@ def arm_worker(
                 except Exception:
                     logger.exception("ArmSink.on_reference_change raised")
 
-            holding = False
             try:
                 sink.dispatch(frame)
             except Exception:
                 # One bad command must not kill the arm thread and strand the
-                # arm wherever it happened to be.
+                # arm wherever it happened to be. Note `holding` is cleared
+                # only on success, so a sink that raises every frame gets one
+                # on_hold, not one per frame.
                 logger.exception("ArmSink.dispatch raised; holding")
                 enter_hold("no_frames")
+            else:
+                holding = False
     finally:
         try:
             sink.close()

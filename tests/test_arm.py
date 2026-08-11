@@ -106,6 +106,47 @@ def test_on_hold_is_edge_triggered():
     assert sink.holds == ["no_frames"]
 
 
+def test_silence_shorter_than_the_deadline_does_not_hold():
+    """The liveness deadline is stale_after_s, not the poll interval.
+
+    Polling more often than the deadline must not freeze the arm: at 30 Hz a
+    100 ms poll would otherwise hold after ~3 missed frames.
+    """
+    frames, sink, stop = LatestFrame(), RecordingArmSink(), threading.Event()
+    thread = _run_worker(frames, sink, stop_event=stop, stale_after_s=0.30, poll_timeout_s=0.01)
+    frames.publish(_frame())
+    time.sleep(0.15)  # 15 polls of silence, but well inside the 0.30 s deadline
+    stop.set()
+    thread.join(timeout=2.0)
+    assert sink.dispatched, "the frame should have been dispatched"
+    assert sink.holds == [], f"held early on the poll interval: {sink.holds}"
+
+
+def test_silence_past_the_deadline_holds():
+    frames, sink, stop = LatestFrame(), RecordingArmSink(), threading.Event()
+    thread = _run_worker(frames, sink, stop_event=stop, stale_after_s=0.05, poll_timeout_s=0.01)
+    frames.publish(_frame())
+    time.sleep(0.25)
+    stop.set()
+    thread.join(timeout=2.0)
+    assert sink.holds == ["no_frames"]
+
+
+def test_a_persistently_raising_dispatch_holds_once():
+    """A broken sink must not be flooded with on_hold at ingress rate."""
+    frames = LatestFrame()
+    sink = RecordingArmSink(dispatch_raises=True)
+    stop = threading.Event()
+    thread = _run_worker(frames, sink, stop_event=stop)
+    for _ in range(6):
+        frames.publish(_frame())
+        time.sleep(0.02)
+    stop.set()
+    thread.join(timeout=2.0)
+    assert len(sink.dispatched) >= 3, "frames should still be attempted"
+    assert sink.holds == ["no_frames"], f"one hold per failing frame: {sink.holds}"
+
+
 def test_hold_re_arms_after_frames_resume():
     frames, sink, stop = LatestFrame(), RecordingArmSink(), threading.Event()
     thread = _run_worker(frames, sink, stop_event=stop, poll_timeout_s=0.01)

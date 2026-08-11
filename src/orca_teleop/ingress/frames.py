@@ -1,13 +1,14 @@
 """Pose and frame types shared by the hand and arm consumers of the ingress.
 
-This module is deliberately dependency-light: numpy and the standard library
-only. No torch, no orca_core, no grpc. An arm controller can
+This module's own imports are numpy and the standard library only — no torch
+and no orca_core, so an arm controller can
 
     from orca_teleop.ingress.frames import LatestFrame, Pose, TeleopFrame
 
-without paying for the retargeting stack, which keeps the door open to moving
-that controller into its own process behind a thin transport shim without the
-contract changing.
+without paying for the retargeting stack (~0.06 s, against ~0.7 s for the full
+package). That keeps the door open to moving that controller into its own
+process behind a thin transport shim without the contract changing. Note the
+import still pulls in grpc today, via ``orca_teleop.ingress.__init__``.
 
 Conventions, once, here:
 
