@@ -45,6 +45,9 @@ avp = [
 ]
 metaquest = [
     "aiohttp>=3.10",
+    # replay_publisher only: read the recorded Quest session off the Hub.
+    "huggingface-hub>=0.23",
+    "pyarrow>=15",
 ]
 manus = [
     "pyzmq>=25.0",
