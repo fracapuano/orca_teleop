@@ -1,0 +1,85 @@
+# tron_arm default configuration.
+#
+# Values marked AMBIGUOUS encode a genuine gap in the LimX SDK guide V0.2.
+# They exist so that a wrong guess is corrected by editing this file, never by
+# editing the encoder. See CLAUDE.md "TRON 2 protocol ground truth".
+
+robot:
+  # Default target is the LOCAL MOCK. Real hardware requires the CLI's --robot
+  # flag plus interactive confirmation (CLAUDE.md hard rule 1).
+  # Vendor default address is ws://10.192.1.2:5000; the lab robot may differ.
+  url: "ws://127.0.0.1:5000"
+  connect_timeout_s: 5.0
+  request_timeout_s: 2.0
+
+servop:
+  # AMBIGUOUS: element layout of left_pos/right_pos.
+  #   pos_quat   -> [x, y, z, qw, qx, qy, qz]        (7/arm, upstream assumption)
+  #   pos_rotmat -> [x, y, z, r11 .. r33]            (12/arm, row-major, vendor sample style)
+  # Resolve on hardware with `tron2_cli.py servop-readback` (guide 9G-09).
+  format: pos_quat
+
+  # Ingress arrives at 30-60 Hz; the required ServoP rate is UNDOCUMENTED
+  # (ServoJ documents >= 500 Hz). We stream at this rate, interpolating between
+  # the two newest targets.
+  rate_hz: 100
+
+  # AMBIGUOUS: whether a single-side key is legal. Default true sends both arms
+  # every tick, holding a frozen pose for the idle arm.
+  send_both: true
+
+workspace:
+  # Vendor reachable boxes, robot base frame (FLU, metres, origin at the centre
+  # of the base lower plane). ServoP range behaviour is undocumented, so we
+  # always clamp ourselves before encoding.
+  left:
+    x: [0.250, 0.732]
+    y: [-0.213, 0.900]
+    z: [-0.673, 0.500]
+  right:
+    x: [0.250, 0.732]
+    y: [-0.900, 0.213]
+    z: [-0.673, 0.500]
+  margin_m: 0.03
+
+velocity:
+  # Cartesian ceilings; divided by servop.rate_hz to give the per-tick step clamp.
+  lin: 0.4   # m/s
+  ang: 1.2   # rad/s
+
+mapping:
+  # "body": T_target = T_robot0 @ inv(T_op0) @ T_op  (contract, guide 9-08)
+  # "world": p_target = p_r0 + s * (p_op - p_op0), rotation unchanged.
+  #          Gated -- requires world_frame_axes_verified: true.
+  translation_frame: body
+  world_frame_axes_verified: false
+
+# Scale applied to the operator's delta translation.
+scale: 0.5
+
+home:
+  # The documented zero configuration: left j0..j6 then right j0..j6, radians.
+  # Every entry is inside the guide's joint limits. No pose is invented here --
+  # any other "home" must be measured on hardware first.
+  joints: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+           0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+ready:
+  # A joint posture that puts BOTH flanges INSIDE the workspace box.
+  #
+  # `home` above is the documented zero configuration, which on a real TRON 2
+  # hangs the arms beside the base -- outside the box, so streaming refuses to
+  # start from there. This is the posture to move to before teleop.
+  #
+  # It is robot-specific, so there is no sensible default. Capture yours once:
+  #   1. move the arms somewhere comfortable and clear, by hand or by remote
+  #   2. uv run python tools/tron2_cli.py --robot <ip> pose      # confirm INSIDE
+  #   3. uv run python tools/tron2_cli.py --robot <ip> capture-ready
+  #   4. paste the printed block here
+  # then before each session:
+  #   uv run python tools/tron2_cli.py --robot <ip> movej-ready
+  joints: [-0.01720, -0.00330, -0.01050, -1.53440, -0.00560, -0.05170, -0.01390, +0.01020, -0.00570, -0.00599, -1.57092, +0.00850, -0.00780, -0.01570]
+
+logging:
+  # Every notify_* message is appended here as JSONL with both clocks.
+  notify_jsonl: "logs/notify.jsonl"

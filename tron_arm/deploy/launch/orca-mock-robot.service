@@ -1,0 +1,25 @@
+# Mock TRON 2, for rehearsal on a host with no robot attached.
+#   sudo cp orca-mock-robot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now orca-mock-robot
+#
+# There is deliberately NO systemd unit for a real-hardware run. run_arm.py
+# requires an interactive confirmation (CLAUDE.md hard rule 1) and systemd has
+# no tty, so such a unit would only ever refuse to start. Powered runs go
+# through tmux-robot.sh, where a human confirms.
+[Unit]
+Description=Mock LimX TRON 2 robot (rehearsal only -- commands no hardware)
+After=network-online.target
+
+[Service]
+Type=simple
+User=orca
+WorkingDirectory=/home/orca/tron_arm
+ExecStart=/home/orca/.local/bin/uv run python -m tron_arm.mock_robot --host 127.0.0.1 --port 5000
+Restart=on-failure
+RestartSec=2
+# Loopback only: never mistakable for the real robot from another host.
+IPAddressAllow=localhost
+IPAddressDeny=any
+
+[Install]
+WantedBy=multi-user.target
