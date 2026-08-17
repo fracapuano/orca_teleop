@@ -210,6 +210,23 @@ class TronArmSink:
         self._call(self._async_connect(), timeout=self._config.robot.connect_timeout_s + 10.0)
 
     async def _async_connect(self) -> None:
+        # Checked before opening a socket: it needs no robot, and failing fast
+        # is better than discovering it after priming.
+        #
+        # LimX: "the API does not support sending commands to only one arm
+        # independently; commands must be sent to both arms simultaneously."
+        # send_both=False therefore cannot work on hardware. It stays valid for
+        # the mock, which can be told to accept single-side messages.
+        url = self._url or self._config.robot.url
+        if not self._config.servop.send_both and not _is_loopback(url):
+            raise Tron2Error(
+                f"servop.send_both is false, but this robot ({url}) requires both "
+                "left_pos and right_pos in every request_servop -- LimX confirmed the API "
+                "does not accept single-arm commands. Set servop.send_both: true. "
+                "(To move one arm only, leave the other at its current pose; that is what "
+                "send_both already does.)"
+            )
+
         client = Tron2Client(self._config, url=self._url)
         await client.connect()
         client.on_notify("*", self._on_notify)
@@ -530,6 +547,17 @@ class TronArmSink:
         if self._loop_thread is not None:
             self._loop_thread.join(timeout=5.0)
         self._loop_thread = None
+
+
+#: Hosts we treat as "not real hardware" -- the mock, and only the mock.
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
+
+
+def _is_loopback(url: str) -> bool:
+    from urllib.parse import urlparse
+
+    host = urlparse(url).hostname
+    return host is not None and host in _LOOPBACK_HOSTS
 
 
 def _recv_ns(frame: Any) -> int:

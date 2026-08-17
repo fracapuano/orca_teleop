@@ -787,3 +787,89 @@ class TestHoldMustNeverMoveTheArm:
         assert accepted == 0, "the step test commanded a servop despite aborting"
         assert "ABORTED BEFORE COMMANDING ANYTHING" in report.text()
         assert len(report.formats) == 1, "it tried the second format anyway"
+
+
+# =====================================================================
+# Vendor-confirmed constraints (LimX, 2026-08)
+# =====================================================================
+class TestVendorConstraints:
+    """LimX answered three ambiguities the guide left open. Each answer closes a
+    configuration that used to look plausible, so each gets a test."""
+
+    def test_rate_below_50hz_is_refused(self, config):
+        """ServoJ and ServoP both require >= 50 Hz. The guide's 500 Hz for
+        ServoJ, and its silence on ServoP, are documentation errors."""
+        import dataclasses
+
+        from tron_arm.config import MIN_SERVOP_RATE_HZ, ConfigError
+
+        assert MIN_SERVOP_RATE_HZ == 50.0
+        for rate in (1.0, 30.0, 49.9):
+            with pytest.raises(ConfigError, match="below the 50 Hz minimum"):
+                dataclasses.replace(
+                    config, servop=dataclasses.replace(config.servop, rate_hz=rate))
+
+    def test_50hz_and_above_is_accepted(self, config):
+        import dataclasses
+
+        for rate in (50.0, 100.0, 200.0):
+            cfg = dataclasses.replace(
+                config, servop=dataclasses.replace(config.servop, rate_hz=rate))
+            assert cfg.servop.rate_hz == rate
+
+    def test_send_both_false_is_refused_against_real_hardware(self, config):
+        """LimX: the API does not accept single-arm commands. send_both=false
+        would fail silently on hardware, so connect refuses it."""
+        import dataclasses
+
+        from tron_arm.tron2_client import Tron2Error
+
+        cfg = dataclasses.replace(
+            config, servop=dataclasses.replace(config.servop, send_both=False))
+        sink = TronArmSink(cfg, url="ws://10.192.1.2:5000")
+        with pytest.raises(Tron2Error, match="does not accept single-arm"):
+            sink.connect()
+        sink.close()
+
+    def test_send_both_false_still_works_against_the_mock(self, config):
+        """The mock can be told to accept single-side messages, and the tests
+        that exercise that path must keep working."""
+        import dataclasses
+
+        with self._mock_on_its_own_loop_sendboth(config) as (robot, cfg):
+            sink = TronArmSink(cfg)
+            sink.connect()
+            try:
+                assert sink.streamer is not None
+            finally:
+                sink.close()
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _mock_on_its_own_loop_sendboth(config):
+        import dataclasses
+        import threading
+
+        loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def spin():
+            asyncio.set_event_loop(loop)
+            loop.call_soon(ready.set)
+            loop.run_forever()
+
+        threading.Thread(target=spin, daemon=True).start()
+        assert ready.wait(5.0)
+        robot = MockTron2(port=0, info_period_s=0.05)
+        asyncio.run_coroutine_threadsafe(robot.start(), loop).result(10.0)
+        cfg = dataclasses.replace(
+            at(config, f"ws://127.0.0.1:{robot.bound_port}"),
+            servop=dataclasses.replace(config.servop, send_both=False),
+            notify_log_path=None,
+        )
+        try:
+            yield robot, cfg
+        finally:
+            with contextlib.suppress(Exception):
+                asyncio.run_coroutine_threadsafe(robot.stop(), loop).result(5.0)
+            loop.call_soon_threadsafe(loop.stop)

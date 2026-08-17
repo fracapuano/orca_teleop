@@ -87,9 +87,9 @@ wrong guess is a config edit, never a code change.
 |---|---|---|
 | `robot.url` | `ws://127.0.0.1:5000` | the mock; `--robot` overrides |
 | `ready.joints` | captured | posture that puts both flanges inside the box |
-| `servop.format` | `pos_quat` | **confirmed on hardware.** `pos_rotmat` is the alternative |
-| `servop.rate_hz` | 100 | interpolated from 30–60 Hz ingress |
-| `servop.send_both` | true | both arms every tick; frozen pose for the idle one |
+| `servop.format` | `pos_quat` | **confirmed on hardware and by LimX** — ServoP takes MoveP's parameters |
+| `servop.rate_hz` | 100 | interpolated from 30–60 Hz ingress; **floor 50 Hz** (LimX) |
+| `servop.send_both` | true | **required** — LimX does not accept single-arm commands. `false` is refused against real hardware |
 | `workspace.*` | vendor boxes | margin 0.03 m held off every face |
 | `velocity.lin/ang` | 0.4 m/s, 1.2 rad/s | divided by rate → per-tick step clamp |
 | `scale` | 0.5 | applied to the delta translation only |
@@ -202,56 +202,22 @@ Measured on a TRON 2, fw `robot-tron2-r-2.1.24`.
 
 ## Still open
 
-1. **Payload compensation** (LimX Q7) — the ORCA hands change mass, CoM and
-   moment arm. The 15 mm sag will change and there is no documented way to tell
-   the controller about it.
-2. **ServoP rate** (Q2) — 100 Hz is our choice; ServoP documents nothing.
-3. **`notify_servop` result codes** (Q4) — undocumented; we treat any `fail*` as failure.
-4. **Arm release for manual positioning** — no documented way to relax a powered arm.
-5. **Operator-side axis check** (runbook step 0) — never run, so
-   `translation_frame: world` stays gated.
+1. **Payload compensation is unavailable.** LimX (2026-08): the end-effector load
+   compensation interface is "still under development". So the ~15 mm
+   steady-state sag cannot be corrected at the controller, and it will change
+   when the ORCA hands are fitted — different mass, centre of mass and moment
+   arm. Re-measure after mounting. It does not affect teleoperation, where the
+   operator closes the loop visually; it matters for anything open-loop.
+2. **`notify_servop` result codes** remain undocumented; we treat any `fail*` as
+   a failure.
+3. **No documented way to relax a powered arm** for manual repositioning.
+4. **Operator-side axis check** (runbook step 0) has never been run, so
+   `mapping.translation_frame: world` stays gated.
 
-## Rehearsing without a headset
-
-Two publishers stand in for a live operator. Both need the robot side running —
-either the mock (`--sim`) or the real robot.
-
-**Real recorded motion** — 30 s of a real hand from a Quest, including a genuine
-half-second tracking dropout at ~4 s where the hand returns 130° rotated:
-
-```bash
-uv run python -m orca_teleop.ingress.metaquest.replay_publisher \
-    --server localhost:50051 --parquet <local copy>
-```
-
-`--hand left`, `--speed 2.0`, `--loop`. Without `--parquet` it downloads from the
-Hub, which needs internet — so fetch it before joining the robot's Wi-Fi.
-
-Note `--loop` ratchets the arm: each loop's epoch change re-latches the origin
-where the arm currently is, so a recording with net displacement walks the arm
-toward a wall. Re-run `movej-ready` between passes.
-
-**Synthetic motion with failures on demand** — dropouts and reference changes
-wherever you want them:
-
-```bash
-uv run python -m orca_teleop.ingress.metaquest.mock_publisher \
-    --server localhost:50051 --dropout-every 5 --dropout-for 1.5 --epoch-change-every 10
-```
-
-## Confirming the robot accepts our commands
-
-`--step-test` drives the robot directly — no operator, no clutch — through the
-runbook's step 4: hold the current pose 5 s, a known-pose readback, ±2 cm
-single-axis steps, and a 2 cm circle. It tries both servop encodings and prints
-PASS/FAIL per format.
-
-```bash
-uv run python tools/run_arm.py --robot <ip> --no-wrist --step-test
-```
-
-Expect `VERDICT: use servop.format: pos_quat`. Max excursion ~3 cm. Worth running
-after any firmware change or if `notify_servop` failures appear.
+Answered by LimX in 2026-08, previously open: the ServoP element format (same as
+MoveP — position + quaternion), the required rate (≥ 50 Hz, not 500), whether
+single-arm commands are legal (they are not), and whether removing the grippers
+faults the arm (it does not).
 
 ## Development
 

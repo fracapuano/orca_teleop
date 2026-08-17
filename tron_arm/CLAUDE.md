@@ -109,14 +109,26 @@ rigid because hand wrist is at 0): command T_BF = T_BH_target @ inv(T_FH).
   right x[0.250,0.732] y[-0.900,0.213] z[-0.673,0.5]. MoveP rejects out-of-range;
   ServoP behavior UNDOCUMENTED -> always clamp ourselves (margin 0.03 m).
 - request_servop: {left_pos: [...], right_pos: [...]}; no response; failures via
-  notify_servop. Element format ambiguous in vendor doc -> config servop.format:
-  "pos_quat" [x,y,z,qw,qx,qy,qz] (7/arm; upstream's assumption and skeleton)
-  | "pos_rotmat" [x,y,z,r11..r33] (12/arm row-major; vendor sample-code style).
-  Whether a single-side key is legal is UNKNOWN -> config servop.send_both
-  (default true; frozen pose for the idle arm).
-- Frames arrive 30-60 Hz; ServoP required rate UNKNOWN (ServoJ documents >=500 Hz).
-  We stream at servop.rate_hz (default 100) interpolating between the two newest
+  notify_servop. RESOLVED by LimX (2026-08): ServoP takes the SAME parameters as
+  MoveP (guide 9-3.6.3), i.e. position + wxyz quaternion -> servop.format
+  "pos_quat" [x,y,z,qw,qx,qy,qz], 7/arm. The guide's "24 values" is a
+  documentation error they will fix. "pos_rotmat" (12/arm) is kept only so
+  --step-test can prove the format rather than assume it.
+- SINGLE-ARM COMMANDS ARE NOT SUPPORTED (LimX, 2026-08): every request_servop
+  must carry both left_pos and right_pos. To move one arm, hold the other at its
+  current pose -- which is exactly what servop.send_both: true does. send_both:
+  false is refused against non-loopback targets.
+- Frames arrive 30-60 Hz. ServoP and ServoJ both require >= 50 Hz (LimX,
+  2026-08); the guide's ">=500 Hz for ServoJ" is a documentation error. We stream
+  at servop.rate_hz (default 100, floor 50) interpolating between the two newest
   targets, paced by recv_monotonic_ns.
+- Removing the LimX grippers does NOT affect the arm: the gripper control
+  interface is independent (LimX, 2026-08). Note this is about the INTERFACE --
+  the gripper's mass still loads the arm, which is a separate matter.
+- END-EFFECTOR LOAD COMPENSATION IS NOT AVAILABLE (LimX, 2026-08; "still under
+  development"). There is no way to tell the controller what the hands weigh, so
+  the ~15 mm steady-state sag cannot be corrected at the robot and will change
+  when the ORCA hands are fitted. Re-measure it then.
 - request_emgy_stop only works when the robot is idle — NOT a motion abort. Abort =
   freeze target + human on the hardware remote.
 - notify_invalid_request echoes malformed messages back — always log all notify_*.

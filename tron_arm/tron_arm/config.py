@@ -54,6 +54,11 @@ JOINT_LOWER = np.array(
     dtype=np.float64,
 )
 
+#: Minimum ServoP/ServoJ command rate, confirmed by LimX. The vendor guide's
+#: ">=500 Hz for ServoJ, unspecified for ServoP" is a documentation error they
+#: have acknowledged; the real requirement is >= 50 Hz for both.
+MIN_SERVOP_RATE_HZ = 50.0
+
 #: Element counts per arm for each servop encoding.
 SERVOP_WIDTH: dict[str, int] = {"pos_quat": 7, "pos_rotmat": 12}
 
@@ -212,6 +217,12 @@ class ServopConfig:
             )
         if not np.isfinite(self.rate_hz) or self.rate_hz <= 0.0:
             raise ConfigError(f"servop.rate_hz: must be > 0, got {self.rate_hz!r}")
+        if self.rate_hz < MIN_SERVOP_RATE_HZ:
+            raise ConfigError(
+                f"servop.rate_hz: {self.rate_hz} Hz is below the {MIN_SERVOP_RATE_HZ:.0f} Hz "
+                "minimum LimX specifies for ServoJ and ServoP. The guide's ServoJ figure "
+                "of 500 Hz is a documentation error LimX has acknowledged."
+            )
         if self.rate_hz > 1000.0:
             raise ConfigError(f"servop.rate_hz: {self.rate_hz} Hz is implausibly high (max 1000)")
 
