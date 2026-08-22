@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import gzip
 import json
@@ -177,75 +178,84 @@ class TestMeta:
         assert log.firmware_version is None
 
 
-_STEP_TEST_REPORTS: dict[tuple, Any] = {}
+# (robot's accepted format, formats to attempt) -- one entry per distinct run.
+_STEP_TEST_SCENARIOS = (
+    ("pos_quat", None),
+    ("pos_rotmat", None),
+    ("pos_rotmat", ("pos_quat",)),
+)
 
 
-def _step_test(accept_format: str, formats: tuple[str, ...] | None = None):
-    """Run --step-test against the mock, once per distinct scenario.
+@pytest.fixture(scope="module")
+def step_reports() -> dict[tuple, Any]:
+    """Every --step-test scenario, run once and concurrently.
 
     Even in ``quick`` mode a step test streams real poses through four phases,
-    so it costs seconds. Six assertions about three scenarios do not need six
-    runs; the report is immutable, so the runs are shared.
+    so each run costs seconds. Two things follow. Seven assertions about three
+    scenarios do not need seven runs -- the report is immutable, so the runs are
+    shared. And the scenarios are independent (each has its own mock on its own
+    ephemeral port) and spend nearly all of that time in ``asyncio.sleep``, so
+    running them together costs about what the slowest one costs alone.
     """
-    key = (accept_format, formats)
-    if key not in _STEP_TEST_REPORTS:
+    async def one(accept_format: str, formats: tuple[str, ...] | None):
         kwargs = {} if formats is None else {"formats": list(formats)}
+        async with MockTron2(port=0, info_period_s=0.05,
+                             accept_format=accept_format) as robot:
+            cfg = at(load_config(), f"ws://127.0.0.1:{robot.bound_port}")
+            cfg = dataclasses.replace(cfg, notify_log_path=None)
+            return await run_step_test(cfg, cfg.robot.url, quick=True, **kwargs)
 
-        async def body():
-            async with MockTron2(port=0, info_period_s=0.05,
-                                 accept_format=accept_format) as robot:
-                cfg = at(load_config(), f"ws://127.0.0.1:{robot.bound_port}")
-                cfg = dataclasses.replace(cfg, notify_log_path=None)
-                return await run_step_test(cfg, cfg.robot.url, quick=True, **kwargs)
+    async def all_of_them():
+        return await asyncio.gather(*(one(fmt, f) for fmt, f in _STEP_TEST_SCENARIOS))
 
-        _STEP_TEST_REPORTS[key] = run(body())
-    return _STEP_TEST_REPORTS[key]
+    return dict(zip(_STEP_TEST_SCENARIOS, run(all_of_them()), strict=True))
 
 
 class TestStepTest:
-    def _run(self, accept_format: str, formats: list[str] | None = None):
-        return _step_test(accept_format, tuple(formats) if formats else None)
+    @staticmethod
+    def _run(reports, accept_format: str, formats: list[str] | None = None):
+        return reports[(accept_format, tuple(formats) if formats else None)]
 
-    def test_identifies_pos_quat(self):
-        report = self._run("pos_quat")
+    def test_identifies_pos_quat(self, step_reports):
+        report = self._run(step_reports, "pos_quat")
         assert report.chosen_format == "pos_quat"
         assert report.format_passed("pos_quat")
         assert not report.format_passed("pos_rotmat")
 
-    def test_identifies_pos_rotmat(self):
-        report = self._run("pos_rotmat")
+    def test_identifies_pos_rotmat(self, step_reports):
+        report = self._run(step_reports, "pos_rotmat")
         assert report.chosen_format == "pos_rotmat"
         assert not report.format_passed("pos_quat")
 
-    def test_runs_all_four_phases_for_the_accepted_format(self):
-        report = self._run("pos_quat")
+    def test_runs_all_four_phases_for_the_accepted_format(self, step_reports):
+        report = self._run(step_reports, "pos_quat")
         names = [r.name for r in report.formats["pos_quat"]]
         assert any("hold" in n for n in names)
         assert any("readback" in n for n in names)
         assert any("axis steps" in n for n in names)
         assert any("circle" in n for n in names)
 
-    def test_rejected_format_short_circuits(self):
+    def test_rejected_format_short_circuits(self, step_reports):
         """A rejected format reports one clear failure, not four confusing ones."""
-        report = self._run("pos_rotmat")
+        report = self._run(step_reports, "pos_rotmat")
         rejected = report.formats["pos_quat"]
         assert rejected[0].notify_failures > 0
         assert all("skipped" in r.detail for r in rejected[1:])
 
-    def test_report_text_prints_pass_fail_per_format(self):
-        text = self._run("pos_quat").text()
+    def test_report_text_prints_pass_fail_per_format(self, step_reports):
+        text = self._run(step_reports, "pos_quat").text()
         assert "[PASS]" in text and "[FAIL]" in text
         assert "pos_quat: ACCEPTED" in text and "pos_rotmat: REJECTED" in text
         assert "VERDICT: use servop.format: pos_quat" in text
 
-    def test_single_format_selection(self):
+    def test_single_format_selection(self, step_reports):
         """Only the requested format is attempted.
 
         Paired with a robot that rejects it, so the run short-circuits after the
         hold phase: what is under test is which formats get iterated, not how
         far any one of them gets.
         """
-        report = self._run("pos_rotmat", formats=["pos_quat"])
+        report = self._run(step_reports, "pos_rotmat", formats=["pos_quat"])
         assert list(report.formats) == ["pos_quat"]
 
     def test_rejects_unknown_arm(self):
