@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import gzip
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -18,7 +18,7 @@ import report_session
 
 from tests.conftest import at, run
 from tron_arm.config import load_config
-from tron_arm.mock_robot import MOCK_VERSION, MockTron2
+from tron_arm.mock_robot import MockTron2
 from tron_arm.session import SessionLogger, collect_meta, git_describe, new_session_id
 from tron_arm.step_test import run_step_test
 
@@ -177,8 +177,20 @@ class TestMeta:
         assert log.firmware_version is None
 
 
-class TestStepTest:
-    def _run(self, accept_format: str, **kwargs):
+_STEP_TEST_REPORTS: dict[tuple, Any] = {}
+
+
+def _step_test(accept_format: str, formats: tuple[str, ...] | None = None):
+    """Run --step-test against the mock, once per distinct scenario.
+
+    Even in ``quick`` mode a step test streams real poses through four phases,
+    so it costs seconds. Six assertions about three scenarios do not need six
+    runs; the report is immutable, so the runs are shared.
+    """
+    key = (accept_format, formats)
+    if key not in _STEP_TEST_REPORTS:
+        kwargs = {} if formats is None else {"formats": list(formats)}
+
         async def body():
             async with MockTron2(port=0, info_period_s=0.05,
                                  accept_format=accept_format) as robot:
@@ -186,7 +198,13 @@ class TestStepTest:
                 cfg = dataclasses.replace(cfg, notify_log_path=None)
                 return await run_step_test(cfg, cfg.robot.url, quick=True, **kwargs)
 
-        return run(body())
+        _STEP_TEST_REPORTS[key] = run(body())
+    return _STEP_TEST_REPORTS[key]
+
+
+class TestStepTest:
+    def _run(self, accept_format: str, formats: list[str] | None = None):
+        return _step_test(accept_format, tuple(formats) if formats else None)
 
     def test_identifies_pos_quat(self):
         report = self._run("pos_quat")
@@ -221,7 +239,13 @@ class TestStepTest:
         assert "VERDICT: use servop.format: pos_quat" in text
 
     def test_single_format_selection(self):
-        report = self._run("pos_quat", formats=["pos_quat"])
+        """Only the requested format is attempted.
+
+        Paired with a robot that rejects it, so the run short-circuits after the
+        hold phase: what is under test is which formats get iterated, not how
+        far any one of them gets.
+        """
+        report = self._run("pos_rotmat", formats=["pos_quat"])
         assert list(report.formats) == ["pos_quat"]
 
     def test_rejects_unknown_arm(self):

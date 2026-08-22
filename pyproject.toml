@@ -28,6 +28,9 @@ orca-teleop-streamer = "orca_teleop.streamer:main"
 [project.optional-dependencies]
 test = [
     "pytest>=8.0",
+    # Opt-in parallel runs: `pytest -n auto --dist loadfile`. Not in addopts, so
+    # a plain `pytest` still works without this extra installed.
+    "pytest-xdist>=3.6",
 ]
 mediapipe = [
     "mediapipe-numpy2",

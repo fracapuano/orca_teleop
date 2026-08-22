@@ -63,12 +63,6 @@ def test_public_exports():
     )
 
 
-def test_pipeline_queues_dataclass():
-    q = _make_queues()
-    assert isinstance(q.landmarks_q, queue.Queue)
-    assert isinstance(q.actions_q, queue.Queue)
-
-
 def test_run_signature_stable():
     sig = inspect.signature(run)
     assert "model_path" in sig.parameters

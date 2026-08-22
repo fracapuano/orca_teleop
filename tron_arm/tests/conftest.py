@@ -11,6 +11,7 @@ import contextlib
 import dataclasses
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, TypeVar
 
@@ -138,3 +139,38 @@ def unchecked_pose(p: Any, q: Any) -> Any:
     object.__setattr__(pose, "position_m", np.asarray(p, dtype=np.float64))
     object.__setattr__(pose, "orientation_wxyz", np.asarray(q, dtype=np.float64))
     return pose
+
+
+def wait_until(predicate: Callable[[], Any], timeout: float = 5.0,
+               interval: float = 0.001) -> bool:
+    """Poll ``predicate`` until it is true, or ``timeout`` elapses.
+
+    Tests wait on a *condition*, never on a fixed duration. A sleep long enough
+    to stay reliable on a loaded CI box is orders of magnitude longer than the
+    event it is waiting for, and it costs that much on every single run.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return bool(predicate())
+
+
+@contextlib.contextmanager
+def fast_close(seconds: float = 0.02) -> Any:
+    """Shorten the sink's pre-close freeze window.
+
+    ``TronArmSink.close`` deliberately keeps streaming for
+    ``FREEZE_BEFORE_CLOSE_S`` (1 s) so a real arm settles before the socket
+    drops. Every test that connects a sink used to pay that second in teardown.
+    Tests that are actually *about* the freeze window set their own value.
+    """
+    from tron_arm import sink as sink_module
+
+    before = sink_module.FREEZE_BEFORE_CLOSE_S
+    sink_module.FREEZE_BEFORE_CLOSE_S = seconds
+    try:
+        yield seconds
+    finally:
+        sink_module.FREEZE_BEFORE_CLOSE_S = before

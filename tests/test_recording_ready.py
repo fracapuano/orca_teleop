@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import queue
 import threading
-import time
 
 import numpy as np
 from orca_core import OrcaJointPositions
@@ -17,6 +16,7 @@ from orca_teleop.recording import (
     wait_for_recording_ready,
     wait_for_teleop_mirror_ready,
 )
+from tests.conftest import wait_until
 
 _SHUTDOWN = object()
 _JOINT_IDS = [f"j{i}" for i in range(3)]
@@ -90,13 +90,16 @@ def test_wait_for_recording_ready_returns_false_on_stop():
     actions_q: queue.Queue = queue.Queue()
     stop_event = threading.Event()
 
-    def stopper():
-        time.sleep(0.05)
-        stop_event.set()
+    def get_observation():
+        stop_event.set()   # the operator hits ctrl-c mid-warm-up
+        return None
 
-    threading.Thread(target=stopper, daemon=True).start()
+    # get_observation only runs once an action has been dequeued, so the stop
+    # has to be reachable through the queue rather than from a timer thread.
+    actions_q.put(_action())
+
     ready = wait_for_recording_ready(
-        get_observation=lambda: None,
+        get_observation=get_observation,
         actions_q=actions_q,
         stop_event=stop_event,
         dispatch_action=None,
@@ -212,14 +215,12 @@ def test_teleop_consumer_loop_mirrors_and_respects_dispatch_gate():
     thread.start()
 
     actions_q.put(_action([1.0, 0.0, 0.0]))
-    time.sleep(0.05)
-    assert mirror.snapshot() is not None
+    assert wait_until(lambda: mirror.snapshot() is not None)
     assert dispatched == []
 
     dispatch_enabled.set()
     actions_q.put(_action([2.0, 0.0, 0.0]))
-    time.sleep(0.05)
-    assert len(dispatched) == 1
+    assert wait_until(lambda: len(dispatched) == 1)
     assert dispatched[0].as_array(_JOINT_IDS)[0] == 2.0
 
     stop_event.set()
@@ -227,22 +228,26 @@ def test_teleop_consumer_loop_mirrors_and_respects_dispatch_gate():
 
 
 def test_wait_for_teleop_mirror_ready_waits_for_mirror_updates():
+    """One mirror update per probe, so the streak builds iff each poll re-reads
+    ``update_count``. Feeding from a timed thread instead made the streak race
+    the poll interval and could never converge."""
     stop_event = threading.Event()
     mirror = TeleopActionMirror()
+    probes = {"n": 0}
 
-    def feed_mirror():
-        for i in range(5):
-            time.sleep(0.02)
-            mirror.update(_action([float(i), 0.0, 0.0]))
+    def get_observation():
+        probes["n"] += 1
+        mirror.update(_action([float(probes["n"]), 0.0, 0.0]))
+        return {"ok": True}
 
-    threading.Thread(target=feed_mirror, daemon=True).start()
     ready = wait_for_teleop_mirror_ready(
-        get_observation=lambda: {"ok": True},
+        get_observation=get_observation,
         mirror=mirror,
         stop_event=stop_event,
-        heartbeat_interval=0.01,
+        heartbeat_interval=0.0,
         min_action_streak=5,
         min_obs_streak=5,
         status_interval_s=100.0,
     )
     assert ready is True
+    assert probes["n"] == 6  # the first poll has no increase to observe yet

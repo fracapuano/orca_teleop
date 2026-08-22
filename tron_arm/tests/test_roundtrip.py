@@ -16,7 +16,6 @@ from tron_arm.streamer import PoseStreamer
 from tron_arm.tron2_client import (
     NOTIFY_INVALID_REQUEST,
     NOTIFY_SERVOP,
-    TITLE_SERVOP,
     Tron2Client,
 )
 

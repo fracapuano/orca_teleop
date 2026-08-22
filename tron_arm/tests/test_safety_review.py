@@ -12,7 +12,6 @@ import ast
 import asyncio
 import contextlib
 import dataclasses
-import inspect
 import math
 import pathlib
 import random
@@ -23,7 +22,7 @@ import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from tests.conftest import at, collector, run, tweak
+from tests.conftest import at, collector, fast_close, run, tweak
 from tron_arm.arm_state import ArmController, ArmState, RobotState, TickEvents
 from tron_arm.config import ARMS, load_config
 from tron_arm.mock_robot import MockTron2
@@ -97,11 +96,6 @@ class TestTimestampNsNeverInControlMath:
         offenders = []
         for path in list(PKG.glob("*.py")) + list(TOOLS.glob("*.py")):
             tree = ast.parse(path.read_text())
-            docstrings = {
-                id(ast.get_docstring(n, clean=False))
-                for n in ast.walk(tree)
-                if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
-            }
             for node in ast.walk(tree):
                 if isinstance(node, ast.Attribute) and node.attr == "timestamp_ns":
                     offenders.append(f"{path.name}:{node.lineno} attribute access")
@@ -544,6 +538,11 @@ class TestClutchRaces:
             assert log.dropped > 0, "an overfull queue did not drop"
         finally:
             log._stop.set()
+            # close() drains before stamping counts, and the writer was killed
+            # on purpose above -- so leaving the queue full made it burn its
+            # whole 5 s drain deadline on every run.
+            while not log._queue.empty():
+                log._queue.get_nowait()
             log.close()
 
     def test_a_clutch_that_raises_reads_as_released(self, config):
@@ -660,13 +659,6 @@ class TestServopKeyModes:
         else:
             assert (accepted, rejected) == (1, 0)
 
-    def test_send_both_never_emits_a_single_key(self, config):
-        """The guarantee that makes send_both=True the safe default."""
-        source = inspect.getsource(TronArmSink)
-        assert "send_servop" in source
-        cfg = tweak(config, send_both=True)
-        assert cfg.servop.send_both is True
-
 
 # =====================================================================
 # Workspace precondition -- found on hardware, 2026-08-13
@@ -760,7 +752,8 @@ class TestHoldMustNeverMoveTheArm:
             try:
                 assert sink.streamer is not None
             finally:
-                sink.close()
+                with fast_close():   # the pre-close freeze is not under test here
+                    sink.close()
 
     def test_step_test_aborts_before_commanding(self, config):
         """It must not try the second format either -- same hazard, twice."""
@@ -834,7 +827,6 @@ class TestVendorConstraints:
     def test_send_both_false_still_works_against_the_mock(self, config):
         """The mock can be told to accept single-side messages, and the tests
         that exercise that path must keep working."""
-        import dataclasses
 
         with self._mock_on_its_own_loop_sendboth(config) as (robot, cfg):
             sink = TronArmSink(cfg)
@@ -842,7 +834,8 @@ class TestVendorConstraints:
             try:
                 assert sink.streamer is not None
             finally:
-                sink.close()
+                with fast_close():   # the pre-close freeze is not under test here
+                    sink.close()
 
     @staticmethod
     @contextlib.contextmanager

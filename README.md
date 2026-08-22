@@ -49,7 +49,12 @@ Tests always run on CI. Run the regression suite from the repository root with:
 
 ```bash
 pytest tests/
+pytest tests/ -n auto --dist loadfile   # same suite, files in parallel
 ```
+
+The parallel form needs the `test` extra (`pytest-xdist`); `--dist loadfile`
+keeps each file on one worker, which is what the tests that bind fixed ports
+rely on.
 
 ## Record Quest WebXR demonstrations on a physical OrcaHand
 

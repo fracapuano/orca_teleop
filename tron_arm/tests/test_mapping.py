@@ -24,7 +24,7 @@ from tron_arm.mapping import (
     invert_transform,
     scale_delta_translation,
 )
-from tron_arm.poses import Pose, quat_angle
+from tron_arm.poses import Pose
 
 SETTINGS = settings(
     max_examples=200,

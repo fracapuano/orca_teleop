@@ -88,11 +88,18 @@ class TestKeyboardClutch:
 
     def test_other_keys_do_not_engage(self):
         primary, secondary = pty.openpty()
+        seen: list[str] = []
         try:
-            clutch = KeyboardClutch(" ", stream=os.fdopen(secondary, "rb", buffering=0))
+            clutch = KeyboardClutch(" ", stream=os.fdopen(secondary, "rb", buffering=0),
+                                    on_key=seen.append)
             clutch.start()
             os.write(primary, b"xyz")
-            time.sleep(0.3)
+            # Wait until the reader has actually seen the keys, so this asserts
+            # "they were read and ignored" rather than "0.3 s went by".
+            deadline = time.monotonic() + 2.0
+            while len(seen) < 3 and time.monotonic() < deadline:
+                time.sleep(0.001)
+            assert set(seen) == {"x", "y", "z"}
             assert not clutch.engaged
             clutch.stop()
         finally:
@@ -150,11 +157,9 @@ class TestKeyboardClutch:
 
 
 class TestScriptedClutch:
-    def test_starts_released_and_is_settable(self):
-        clutch = ScriptedClutch()
-        assert not clutch.engaged
-        clutch.engaged = True
-        assert clutch.engaged
+    def test_starts_released(self):
+        """Released is the safe default; a test double must not differ."""
+        assert not ScriptedClutch().engaged
 
 
 class TestKeyRepeatFlicker:

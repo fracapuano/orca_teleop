@@ -73,8 +73,10 @@ ORCA_TELEOP_SRC at a checkout to run it against the real frames.py.
   arm_sink=None). NOTE wrist_enabled DEFAULTS TO TRUE, so tools/run_arm.py must pass
   wrist_enabled=False explicitly -- it refuses to run against hardware without
   --no-wrist, because a live wrist makes the rigid T_FH offset wrong.
-- Tests: `uv run pytest tests/ --ignore=tests/test_recording_ready.py`
-  (that test hangs; pre-existing). `uv run` syncs the full dep set including torch and
+- Tests: `uv run pytest tests/`, or `-n auto --dist loadfile` to run the files
+  in parallel (needs the `dev` extra; ~3x). test_recording_ready no longer hangs
+  -- its mirror-readiness test used to race the poll interval and never converge.
+  `uv run` syncs the full dep set including torch and
   pytorch-kinematics (~1 GB). Only tests/test_pipeline.py, test_retargeter.py and
   test_streamer.py need those; the other 69 tests (incl. test_arm.py) run against
   grpcio + numpy + protobuf + a --no-deps orca_core, which is all the ARM path needs.

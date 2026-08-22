@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from orca_teleop.ingress.metaquest.bridge import (
+    QuestTelemetryBridge,
     QuestTelemetryState,
     WebXRHandSample,
 )
@@ -278,10 +279,20 @@ def test_mock_dropout_removes_the_hand_entirely():
 
 
 def test_mock_bridge_satisfies_the_publisher_interface():
-    """MockQuestBridge is duck-typed; a rename in the real bridge must show up."""
+    """MockQuestBridge is duck-typed; a rename in the real bridge must show up.
+
+    Checked against QuestTelemetryBridge itself rather than a hardcoded list of
+    names -- a list only ever describes the mock, so it could not catch the
+    upstream rename this is here to catch.
+    """
     bridge = MockQuestBridge(side="right", fps=30)
+    # Constructing the real bridge is inert -- no socket, no thread until start().
+    real = QuestTelemetryBridge()
     for attribute in ("state", "start", "stop", "url", "ssl_context"):
-        assert hasattr(bridge, attribute)
+        assert hasattr(real, attribute), (
+            f"the real bridge no longer has {attribute!r}; the publisher contract moved"
+        )
+        assert hasattr(bridge, attribute), f"the mock never grew {attribute!r}"
     publisher = MetaQuestPublisher(bridge=bridge)
     assert publisher.bridge is bridge
 

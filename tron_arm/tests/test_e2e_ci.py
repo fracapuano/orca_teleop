@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -34,12 +35,34 @@ sys.path.insert(0, str(TOOLS))
 
 import report_session  # noqa: E402
 
-RUN_SECONDS = 10.0
+RUN_SECONDS = 8.0
 pytestmark = pytest.mark.slow
 
 
 def _python() -> str:
     return sys.executable
+
+
+def _await_port(port: int, proc: subprocess.Popen, what: str, timeout: float = 30.0) -> None:
+    """Block until ``port`` accepts a connection, or ``proc`` dies.
+
+    Waiting for the socket beats sleeping a guessed number of seconds twice
+    over: it returns as soon as the process is actually up, and it reports the
+    child's own output when it never comes up at all.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise AssertionError(
+                f"{what} exited {proc.returncode} during startup:\n"
+                f"{proc.communicate()[0][-3000:]}"
+            )
+        with socket.socket() as probe:
+            probe.settimeout(0.25)
+            if probe.connect_ex(("127.0.0.1", port)) == 0:
+                return
+        time.sleep(0.02)
+    raise AssertionError(f"{what} never bound port {port} within {timeout:.0f}s")
 
 
 def _orca_teleop_python() -> str:
@@ -60,8 +83,7 @@ def session(tmp_path_factory) -> dict:
     )
     publisher = None
     try:
-        time.sleep(1.5)
-        assert robot.poll() is None, "mock robot died on startup"
+        _await_port(5057, robot, "mock robot")
 
         arm = subprocess.Popen(
             [_python(), str(TOOLS / "run_arm.py"),
@@ -72,8 +94,7 @@ def session(tmp_path_factory) -> dict:
              "--log-dir", str(log_root), "--session-id", session_id],
             cwd=REPO, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         )
-        time.sleep(2.5)  # let the ingress bind before the publisher connects
-        assert arm.poll() is None, f"run_arm died: {arm.communicate()[0][-2000:]}"
+        _await_port(50077, arm, "run_arm ingress")
 
         publisher = subprocess.Popen(
             [_orca_teleop_python(), "-m", "orca_teleop.ingress.metaquest.mock_publisher",
@@ -133,7 +154,7 @@ class TestAchievedRate:
 
     def test_no_late_ticks_to_speak_of(self, session):
         streamer = session["meta"]["final_stats"]["streamer"]
-        # A handful across 10 s is scheduler noise; a flood means we cannot keep up.
+        # A handful across the run is scheduler noise; a flood means we cannot keep up.
         assert streamer["late_ticks"] < 0.02 * streamer["ticks"], streamer
 
 

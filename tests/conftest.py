@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import threading
+import time
 
 import numpy as np
 import pytest
+from orca_core import OrcaJointPositions
 from orca_core.hardware_hand import MockOrcaHand
 
 CANONICAL_LANDMARK_SHAPE = (21, 3)
@@ -70,6 +72,19 @@ def patch_mock_hand(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_orca_joint_registry():
+    """Undo ``OrcaJointPositions.register_joint_names`` after every test.
+
+    It writes a process-global ClassVar, so any test that builds a hand made
+    every later test that uses synthetic joint ids fail -- purely on collection
+    order. Restoring it here keeps the suite order-independent.
+    """
+    before = OrcaJointPositions._default_joint_ids
+    yield
+    OrcaJointPositions._default_joint_ids = before
+
+
+@pytest.fixture(autouse=True)
 def _no_thread_leaks():
     """Fail any test that leaks a non-daemon thread it spawned."""
     before = {t.ident for t in threading.enumerate()}
@@ -80,3 +95,18 @@ def _no_thread_leaks():
         t.join(timeout=1.0)
     still_alive = [t.name for t in leaked if t.is_alive()]
     assert not still_alive, f"leaked threads: {still_alive}"
+
+
+def wait_until(predicate, timeout: float = 5.0, interval: float = 0.001) -> bool:
+    """Poll ``predicate`` until it is true, or ``timeout`` elapses.
+
+    Tests wait on a *condition*, never on a fixed duration: a sleep long enough
+    to be reliable on a loaded CI box is thousands of times longer than the
+    event actually takes.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()

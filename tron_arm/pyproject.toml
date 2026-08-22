@@ -6,7 +6,10 @@ requires-python = ">=3.10"
 dependencies = ["numpy", "scipy", "websockets", "pyyaml"]
 
 [project.optional-dependencies]
-dev = ["pytest", "hypothesis"]
+# `pytest-xdist` is opt-in: `pytest -n auto --dist loadfile` runs the files in
+# parallel (~3x). It is deliberately NOT in addopts so a plain `pytest` keeps
+# working for anyone who has not synced this extra.
+dev = ["pytest", "hypothesis", "pytest-xdist>=3.6"]
 # For tests/test_integration_pipeline.py and tools/run_arm.py. orca_teleop is NOT a
 # runtime dependency of this package: the mock, the CLI and the sink maths all import
 # without it. The arm path needs only grpcio+protobuf, not torch.

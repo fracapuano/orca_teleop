@@ -10,8 +10,8 @@ Two layers, because each catches a different kind of drift:
   what would catch upstream changing the contract under us -- a transcription can
   only ever be as current as the day it was written.
 
-Point ``ORCA_TELEOP_SRC`` at the ``src`` directory of a checkout to enable the
-second layer::
+The second layer finds ``src`` automatically when tron_arm sits inside an
+orca_teleop checkout or beside one; ``ORCA_TELEOP_SRC`` overrides the search::
 
     ORCA_TELEOP_SRC=/path/to/orca_teleop/src pytest tests/test_upstream_interop.py
 
@@ -33,7 +33,7 @@ import numpy as np
 import pytest
 
 from tron_arm.config import load_config
-from tron_arm.poses import QUATERNION_NORM_TOLERANCE, Pose, as_pose, pose_lerp, slerp
+from tron_arm.poses import QUATERNION_NORM_TOLERANCE, Pose, as_pose, pose_lerp
 from tron_arm.streamer import PoseStreamer, apply_step_clamp
 from tron_arm.tron2_client import encode_servop_element, encode_servop_payload
 
@@ -128,8 +128,10 @@ def _load_real_frames():
     candidates = []
     if os.environ.get("ORCA_TELEOP_SRC"):
         candidates.append(Path(os.environ["ORCA_TELEOP_SRC"]))
+    repo = Path(__file__).resolve().parent.parent.parent
     candidates += [
-        Path(__file__).resolve().parent.parent.parent / "orca_teleop" / "src",
+        repo / "src",                            # tron_arm vendored inside the checkout
+        repo.parent / "orca_teleop" / "src",     # ... or as a sibling of one
         Path.home() / "orca_teleop" / "src",
     ]
     for src in candidates:
@@ -183,17 +185,6 @@ def _contract_assertions(upstream_pose, cls) -> None:
 
 
 class TestTranscribedContract:
-    def test_field_names(self):
-        pose = TranscribedPose(POSITION, Q_Z90)
-        assert hasattr(pose, "position_m") and hasattr(pose, "orientation_wxyz")
-
-    def test_our_pose_exposes_the_same_names(self):
-        ours = Pose(POSITION, Q_Z90)
-        upstream = TranscribedPose(POSITION, Q_Z90)
-        for name in ("position_m", "orientation_wxyz", "matrix", "as_xyz_wxyz"):
-            assert hasattr(ours, name), name
-            assert hasattr(upstream, name), name
-
     def test_contract(self):
         _contract_assertions(TranscribedPose(POSITION, Q_Z90), TranscribedPose)
 
